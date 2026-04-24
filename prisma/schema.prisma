@@ -1,0 +1,274 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  FUNCIONARIO
+  COZINHA
+  MOTOBOY
+  CLIENTE
+}
+
+enum OrderStatus {
+  RECEBIDO
+  EM_PREPARO
+  PRONTO
+  SAIU_PARA_ENTREGA
+  ENTREGUE
+  CANCELADO
+}
+
+enum PaymentStatus {
+  PENDENTE
+  APROVADO
+  RECUSADO
+  ESTORNADO
+}
+
+enum CouponType {
+  PERCENTUAL
+  VALOR_FIXO
+}
+
+enum MeatDoneness {
+  MAL_PASSADO
+  AO_PONTO
+  BEM_PASSADO
+}
+
+// ─── Usuário ─────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String?  @unique
+  phone        String?  @unique
+  cpf          String?  @unique
+  address      String?
+  passwordHash String
+  role         Role     @default(CLIENTE)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orders Order[]
+}
+
+// ─── Produto ─────────────────────────────────────────────────────────────────
+// Um produto pode ser um hambúrguer, acompanhamento ou bebida.
+// Se isBurger=true, aceita ponto da carne (MeatDoneness).
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  imageUrl    String?
+  category    String   @default("Hambúrgueres") // Hambúrgueres | Acompanhamentos | Bebidas | Sobremesas
+  basePrice   Decimal  @db.Decimal(10, 2)
+  isBurger    Boolean  @default(false) // aceita MeatDoneness quando true
+  isActive    Boolean  @default(true)
+  isAvailable Boolean  @default(true) // pode ser desativado temporariamente sem excluir
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Adicionais disponíveis para este produto
+  productAddons      ProductAddon[]
+  // Ingredientes que compõem este produto (para controle de estoque)
+  productIngredients ProductIngredient[]
+  // Partes de combos que usam este produto
+  comboParts         ComboPart[]
+  // Itens de pedido que referenciam este produto
+  orderItems         OrderItem[]
+}
+
+// ─── Adicional (Extra) ────────────────────────────────────────────────────────
+// Ex: bacon extra, queijo extra, ovo, molho especial, etc.
+
+model Addon {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  price       Decimal  @db.Decimal(10, 2)
+  category    String   @default("Extra") // Extra | Molho | Queijo | Proteína
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  productAddons   ProductAddon[]
+  orderItemAddons OrderItemAddon[]
+}
+
+// Tabela de relacionamento Produto ↔ Addon
+model ProductAddon {
+  productId String
+  addonId   String
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  addon   Addon   @relation(fields: [addonId], references: [id], onDelete: Cascade)
+
+  @@id([productId, addonId])
+}
+
+// ─── Ingrediente / Insumo (Estoque) ──────────────────────────────────────────
+
+model Ingredient {
+  id            String   @id @default(cuid())
+  name          String   @unique
+  unit          String   @default("un") // un | g | kg | ml | l
+  stockQuantity Float    @default(0)
+  minStock      Float    @default(0) // alerta de estoque mínimo
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  productIngredients ProductIngredient[]
+}
+
+// Quantidade de cada ingrediente necessária para produzir 1 unidade do produto
+model ProductIngredient {
+  productId    String
+  ingredientId String
+  quantity     Float // ex: 200 (gramas) de carne
+
+  product    Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  ingredient Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+
+  @@id([productId, ingredientId])
+}
+
+// ─── Combo ────────────────────────────────────────────────────────────────────
+// Agrupa múltiplos produtos (ex: Burgão + Batata + Coca) com preço promocional.
+
+model Combo {
+  id               String   @id @default(cuid())
+  name             String
+  description      String?
+  imageUrl         String?
+  promotionalPrice Decimal  @db.Decimal(10, 2)
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  parts      ComboPart[]
+  orderItems OrderItem[]
+}
+
+// Itens que compõem o combo (ex: 1x Burgão, 1x Batata, 1x Coca)
+model ComboPart {
+  id        String @id @default(cuid())
+  comboId   String
+  productId String
+  quantity  Int    @default(1)
+
+  combo   Combo   @relation(fields: [comboId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+}
+
+// ─── Cupom de Desconto ────────────────────────────────────────────────────────
+
+model Coupon {
+  id            String     @id @default(cuid())
+  code          String     @unique
+  type          CouponType
+  value         Decimal    @db.Decimal(10, 2) // % ou R$
+  minOrderValue Decimal?   @db.Decimal(10, 2) // valor mínimo do pedido para aplicar
+  maxUses       Int? // null = ilimitado
+  usedCount     Int        @default(0)
+  isActive      Boolean    @default(true)
+  expiresAt     DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  orders Order[]
+}
+
+// ─── Pedido ───────────────────────────────────────────────────────────────────
+
+model Order {
+  id                String        @id @default(cuid())
+  userId            String?
+  status            OrderStatus   @default(RECEBIDO)
+  subtotal          Decimal       @db.Decimal(10, 2) // antes do desconto + frete
+  discount          Decimal       @default(0) @db.Decimal(10, 2)
+  deliveryFee       Decimal?      @db.Decimal(10, 2)
+  total             Decimal       @db.Decimal(10, 2) // subtotal - discount + deliveryFee
+  paymentStatus     PaymentStatus @default(PENDENTE)
+  paymentMethod     String?
+  deliveryAddress   String?
+  deliveryLat       Float?
+  deliveryLon       Float?
+  isPickup          Boolean       @default(false)
+  notes             String?
+  deliveryCode      String? // código de 4 dígitos para confirmar entrega
+  assignedMotoboyId String?
+  couponId          String?
+  terminalIntentId  String? // ID da intenção de pagamento na maquininha MP Point
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  deliveredAt       DateTime?
+
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  coupon Coupon? @relation(fields: [couponId], references: [id])
+
+  items   OrderItem[]
+  payment Payment?
+}
+
+// ─── Item do Pedido ───────────────────────────────────────────────────────────
+
+model OrderItem {
+  id        String @id @default(cuid())
+  orderId   String
+  productId String?
+  comboId   String?
+  quantity  Int    @default(1)
+  unitPrice Decimal @db.Decimal(10, 2) // preço base + adicionais, por unidade
+  totalPrice Decimal @db.Decimal(10, 2) // unitPrice × quantity
+
+  // Customizações
+  notes              String? // observação livre do cliente (ex: "sem cebola")
+  meatDoneness       MeatDoneness? // ponto da carne (só para hambúrgueres)
+  removedIngredients String[] // ingredientes removidos pelo cliente
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: Restrict)
+  combo   Combo?   @relation(fields: [comboId], references: [id], onDelete: Restrict)
+
+  addons OrderItemAddon[]
+}
+
+// Adicionais escolhidos em cada item do pedido
+model OrderItemAddon {
+  id          String  @id @default(cuid())
+  orderItemId String
+  addonId     String
+  quantity    Int     @default(1)
+  unitPrice   Decimal @db.Decimal(10, 2)
+  totalPrice  Decimal @db.Decimal(10, 2) // unitPrice × quantity
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  addon     Addon     @relation(fields: [addonId], references: [id], onDelete: Restrict)
+}
+
+// ─── Pagamento ────────────────────────────────────────────────────────────────
+
+model Payment {
+  id         String        @id @default(cuid())
+  orderId    String        @unique
+  provider   String // MERCADO_PAGO | DINHEIRO | CREDITO | DEBITO
+  externalId String?       @unique // ID do pagamento no Mercado Pago
+  amount     Decimal       @db.Decimal(10, 2)
+  status     PaymentStatus @default(PENDENTE)
+  payload    Json?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+}

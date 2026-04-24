@@ -1,0 +1,22 @@
+# Dependências
+node_modules/
+
+# Variáveis de ambiente
+.env
+.env.local
+.env.*.local
+
+# Prisma
+prisma/generated/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build
+dist/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
