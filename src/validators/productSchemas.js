@@ -1,28 +1,72 @@
 import { z } from "zod";
 
-// ─── Produto ──────────────────────────────────────────────────────────────────
-export const createProductSchema = z.object({
-  name: z.string().min(2).max(120),
-  description: z.string().max(500).optional().nullable(),
-  imageUrl: z
-    .union([z.string().url(), z.literal("")])
-    .optional()
-    .nullable(),
-  category: z
-    .enum([
-      "Hambúrgueres",
-      "Acompanhamentos",
-      "Bebidas",
-      "Sobremesas",
-      "Outros",
-    ])
-    .optional(),
-  basePrice: z.number().positive(),
-  isBurger: z.boolean().optional(),
-  addonIds: z.array(z.string().cuid()).optional(), // adicionais disponíveis
-});
+const moneyValue = z.coerce.number().positive();
 
-export const updateProductSchema = createProductSchema.partial();
+// ─── Produto ──────────────────────────────────────────────────────────────────
+export const createProductSchema = z
+  .object({
+    name: z.string().min(2).max(120),
+    description: z.string().max(500).optional().nullable(),
+    imageUrl: z
+      .union([z.string().url(), z.literal("")])
+      .optional()
+      .nullable(),
+    category: z
+      .enum([
+        "Hambúrgueres",
+        "Acompanhamentos",
+        "Bebidas",
+        "Sobremesas",
+        "Outros",
+      ])
+      .optional(),
+    basePrice: moneyValue.optional(),
+    price: moneyValue.optional(),
+    isBurger: z.boolean().optional(),
+    addonIds: z.array(z.string().cuid()).optional(), // adicionais disponíveis
+  })
+  .superRefine((data, ctx) => {
+    if (data.basePrice === undefined && data.price === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "basePrice (ou price) e obrigatorio.",
+        path: ["basePrice"],
+      });
+    }
+  })
+  .transform(({ price, basePrice, ...rest }) => ({
+    ...rest,
+    basePrice: basePrice ?? price,
+  }));
+
+export const updateProductSchema = z
+  .object({
+    name: z.string().min(2).max(120).optional(),
+    description: z.string().max(500).optional().nullable(),
+    imageUrl: z
+      .union([z.string().url(), z.literal("")])
+      .optional()
+      .nullable(),
+    category: z
+      .enum([
+        "Hambúrgueres",
+        "Acompanhamentos",
+        "Bebidas",
+        "Sobremesas",
+        "Outros",
+      ])
+      .optional(),
+    basePrice: moneyValue.optional(),
+    price: moneyValue.optional(),
+    isBurger: z.boolean().optional(),
+    addonIds: z.array(z.string().cuid()).optional(),
+  })
+  .transform(({ price, basePrice, ...rest }) => ({
+    ...rest,
+    ...(basePrice !== undefined || price !== undefined
+      ? { basePrice: basePrice ?? price }
+      : {}),
+  }));
 
 // ─── Adicional ────────────────────────────────────────────────────────────────
 export const createAddonSchema = z.object({
