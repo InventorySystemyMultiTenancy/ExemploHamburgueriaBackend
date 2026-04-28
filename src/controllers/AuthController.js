@@ -9,10 +9,12 @@ export class AuthController {
   async register(req, res, next) {
     try {
       const payload = registerSchema.parse(req.body);
-      const result = await authService.register(payload, null);
-      return res
-        .status(201)
-        .json({ message: "Usuario criado com sucesso.", data: result });
+      const user = await authService.register(payload, null);
+
+      return res.status(201).json({
+        message: "Usuario criado com sucesso.",
+        data: user,
+      });
     } catch (error) {
       return this.#handleError(error, next);
     }
@@ -21,13 +23,12 @@ export class AuthController {
   async createUserByAdmin(req, res, next) {
     try {
       const payload = registerSchema.parse(req.body);
-      const result = await authService.register(payload, req.user);
-      return res
-        .status(201)
-        .json({
-          message: "Usuario da equipe criado com sucesso.",
-          data: result,
-        });
+      const user = await authService.register(payload, req.user);
+
+      return res.status(201).json({
+        message: "Usuario da equipe criado com sucesso.",
+        data: user,
+      });
     } catch (error) {
       return this.#handleError(error, next);
     }
@@ -37,9 +38,11 @@ export class AuthController {
     try {
       const payload = loginSchema.parse(req.body);
       const result = await authService.login(payload);
-      return res
-        .status(200)
-        .json({ message: "Login realizado com sucesso.", data: result });
+
+      return res.status(200).json({
+        message: "Login realizado com sucesso.",
+        data: result,
+      });
     } catch (error) {
       return this.#handleError(error, next);
     }
@@ -49,6 +52,7 @@ export class AuthController {
     if (error instanceof ZodError) {
       return next(new AppError("Payload invalido.", 422, error.flatten()));
     }
+
     return next(error);
   }
 }

@@ -1,36 +1,59 @@
 import axios from "axios";
 import { AppError } from "../errors/AppError.js";
 
-const STORE_LAT = parseFloat(process.env.STORE_LAT || "-23.5505");
-const STORE_LON = parseFloat(process.env.STORE_LON || "-46.6333");
-const TAXA_BASE = parseFloat(process.env.DELIVERY_BASE_FEE || "6.0");
-const TAXA_POR_KM = parseFloat(process.env.DELIVERY_FEE_PER_KM || "2.5");
+// ─── Constantes da Pizzaria ───────────────────────────────────────────────────
+// Endereço fixo: Avenida Cachoeira Paulista, 17 — CEP 03551-000, São Paulo
+const PIZZARIA_LAT = -23.5318;
+const PIZZARIA_LON = -46.5043;
 
-const formatBRL = (v) =>
-  v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+const TAXA_BASE = 5.0; // R$ 5,00 fixo (saída do motoboy)
+const TAXA_POR_KM = 2.0; // R$ 2,00 por km rodado
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const formatBRL = (valor) =>
+  valor.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+
+/**
+ * Executa uma chamada axios com retry automático em caso de falha de rede/timeout.
+ * Não retenta erros HTTP 4xx (erros do cliente).
+ */
 async function axiosWithRetry(config, maxRetries = 2) {
   let lastErr;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await axios(config);
     } catch (err) {
+      // Não retenta se for erro HTTP com resposta (4xx/5xx do servidor externo)
       if (err.response) throw err;
       lastErr = err;
-      if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 500));
+      // Aguarda 500ms antes de tentar de novo (exceto na última tentativa)
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
     }
   }
   throw lastErr;
 }
 
+// ─── Serviço de Entrega ───────────────────────────────────────────────────────
 export class DeliveryService {
+  /**
+   * Calcula o frete com base no CEP, número e cidade do cliente.
+   * @param {string} cep    - CEP do cliente (com ou sem traço)
+   * @param {string} numero - Número da residência
+   * @param {string} cidade - Cidade do cliente
+   * @returns {{ distanciaKm: number, valorFrete: string, tempoEstimado: number }}
+   */
   async calculateFreight({ cep, numero, cidade, rua }) {
+    // ── Etapa 1: Geocodificação via Nominatim ────────────────────────────────
     const cleanCep = cep.replace(/\D/g, "");
-    const query = rua?.trim()
-      ? `${rua.trim()}, ${numero}, ${cidade}, Brasil`
-      : `${cleanCep}, ${numero}, ${cidade}, Brasil`;
+    // Usa o nome da rua quando disponível para maior precisão
+    const query =
+      rua && rua.trim()
+        ? `${rua.trim()}, ${numero}, ${cidade}, Brasil`
+        : `${cleanCep}, ${numero}, ${cidade}, Brasil`;
 
-    let lat, lon;
+    let lat, lon, displayName;
 
     try {
       const nominatimRes = await axiosWithRetry({
@@ -41,69 +64,76 @@ export class DeliveryService {
           format: "json",
           limit: 1,
           countrycodes: "br",
+          // Restringe ao município de São Paulo (bounding box)
+          viewbox: "-46.8254,-23.3568,-46.3648,-24.0085",
+          bounded: 1,
         },
         headers: {
-          "User-Agent": `${process.env.STORE_NAME || "Hamburgueria"}/1.0`,
+          "User-Agent": "PizzariaFellice/1.0 (contato@pizzariafellice.com.br)",
           "Accept-Language": "pt-BR",
         },
         timeout: 15000,
       });
 
-      if (!nominatimRes.data?.length) {
+      if (!nominatimRes.data || nominatimRes.data.length === 0) {
         throw new AppError(
-          "Endereco nao encontrado. Verifique o CEP, numero e cidade informados.",
+          "Endereço não encontrado. Verifique o CEP, número e cidade informados.",
           422,
         );
       }
 
       lat = parseFloat(nominatimRes.data[0].lat);
       lon = parseFloat(nominatimRes.data[0].lon);
+      displayName = nominatimRes.data[0].display_name;
     } catch (err) {
       if (err instanceof AppError) throw err;
       throw new AppError(
-        "Servico de geocodificacao indisponivel. Tente novamente.",
-        503,
+        "Falha ao consultar serviço de geocodificação. Tente novamente.",
+        502,
       );
     }
 
-    // OSRM para distância real de rota
-    let distanciaKm;
+    // ── Etapa 2: Cálculo de Rota via OSRM ───────────────────────────────────
+    let distanceMeters, durationSeconds;
 
     try {
       const osrmRes = await axiosWithRetry({
         method: "get",
-        url: `https://router.project-osrm.org/route/v1/driving/${STORE_LON},${STORE_LAT};${lon},${lat}`,
+        url: `http://router.project-osrm.org/route/v1/driving/${PIZZARIA_LON},${PIZZARIA_LAT};${lon},${lat}`,
         params: { overview: "false" },
-        timeout: 10000,
+        timeout: 15000,
       });
 
-      const routes = osrmRes.data?.routes;
-      if (!routes?.length) throw new Error("Sem rota encontrada");
+      if (osrmRes.data.code !== "Ok" || !osrmRes.data.routes?.[0]) {
+        throw new AppError(
+          "Não foi possível calcular a rota para o endereço informado.",
+          422,
+        );
+      }
 
-      distanciaKm = routes[0].distance / 1000;
-    } catch {
-      // Fallback: distância euclidiana × 1.3 (fator de tortuosidade)
-      const R = 6371;
-      const dLat = ((lat - STORE_LAT) * Math.PI) / 180;
-      const dLon = ((lon - STORE_LON) * Math.PI) / 180;
-      const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos((STORE_LAT * Math.PI) / 180) *
-          Math.cos((lat * Math.PI) / 180) *
-          Math.sin(dLon / 2) ** 2;
-      distanciaKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 1.3;
+      distanceMeters = osrmRes.data.routes[0].distance;
+      durationSeconds = osrmRes.data.routes[0].duration;
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      throw new AppError(
+        "Falha ao calcular rota de entrega. Tente novamente.",
+        502,
+      );
     }
 
-    const valorFrete = TAXA_BASE + distanciaKm * TAXA_POR_KM;
-    const tempoEstimado = Math.round(10 + distanciaKm * 3); // min
+    // ── Etapa 3: Cálculo do Frete ────────────────────────────────────────────
+    const distanciaKm = Math.round((distanceMeters / 1000) * 10) / 10;
+    const valorFreteNumerico = TAXA_BASE + distanciaKm * TAXA_POR_KM;
+    const tempoEstimado = Math.ceil(durationSeconds / 60);
 
     return {
-      distanciaKm: parseFloat(distanciaKm.toFixed(2)),
-      valorFrete: parseFloat(valorFrete.toFixed(2)),
-      valorFreteFormatado: formatBRL(valorFrete),
-      tempoEstimado,
       lat,
       lon,
+      displayName,
+      distanciaKm,
+      valorFrete: formatBRL(valorFreteNumerico),
+      valorFreteNumerico: Math.round(valorFreteNumerico * 100) / 100,
+      tempoEstimado,
     };
   }
 }

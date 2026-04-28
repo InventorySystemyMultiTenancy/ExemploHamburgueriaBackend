@@ -1,34 +1,28 @@
 import { z } from "zod";
 
-// ─── Schema de adicional escolhido pelo cliente ───────────────────────────────
-const addonRequestSchema = z.object({
-  addonId: z.string().cuid("addonId invalido"),
-  quantity: z.number().int().positive().max(10).optional().default(1),
-});
-
-// ─── Schema de item de pedido ─────────────────────────────────────────────────
-const orderItemSchema = z
+const itemSchema = z
   .object({
-    productId: z.string().cuid().optional(),
-    comboId: z.string().cuid().optional(),
-    quantity: z.number().int().positive().max(20).optional().default(1),
-    notes: z.string().max(500).optional(), // ex: "sem cebola, bem molhado"
-    meatDoneness: z.enum(["MAL_PASSADO", "AO_PONTO", "BEM_PASSADO"]).optional(), // ponto da carne (só hambúrgueres)
-    removedIngredients: z
-      .array(z.string().max(100))
-      .max(20)
-      .optional()
-      .default([]), // ingredientes a remover
-    addons: z.array(addonRequestSchema).max(20).optional().default([]),
+    productId: z.string().cuid(),
+    quantity: z.number().int().positive().max(20).optional(),
+    addonIds: z.array(z.string().cuid()).max(20).optional().default([]),
+    removedIngredients: z.string().trim().min(1).max(255).optional(),
+    notes: z.string().max(500).optional(),
   })
-  .refine((data) => !!(data.productId || data.comboId), {
-    message: "Item deve ter productId ou comboId.",
-  })
-  .refine((data) => !(data.productId && data.comboId), {
-    message: "Item nao pode ter productId e comboId simultaneamente.",
+  .superRefine((item, ctx) => {
+    if (!item.addonIds?.length) {
+      return;
+    }
+
+    const uniqueCount = new Set(item.addonIds).size;
+    if (uniqueCount !== item.addonIds.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "addonIds nao pode conter IDs repetidos.",
+        path: ["addonIds"],
+      });
+    }
   });
 
-// ─── Schema de criação de pedido ──────────────────────────────────────────────
 export const createOrderSchema = z.object({
   deliveryAddress: z.string().min(1).max(255).optional(),
   isPickup: z.boolean().optional(),
@@ -37,37 +31,33 @@ export const createOrderSchema = z.object({
   deliveryFee: z.number().nonnegative().optional(),
   deliveryLat: z.number().optional(),
   deliveryLon: z.number().optional(),
-  couponCode: z.string().max(50).optional(),
-  items: z.array(orderItemSchema).min(1).max(30),
+  items: z.array(itemSchema).min(1).max(30),
 });
 
-// ─── Schema de atualização de status ─────────────────────────────────────────
-export const updateOrderStatusSchema = z.object({
-  status: z.enum([
-    "EM_PREPARO",
-    "PRONTO",
-    "SAIU_PARA_ENTREGA",
-    "ENTREGUE",
-    "CANCELADO",
-  ]),
-});
-
-// ─── Schema de cálculo de frete ───────────────────────────────────────────────
 export const deliveryFreightSchema = z.object({
-  cep: z.string().regex(/^\d{5}-?\d{3}$/, "CEP invalido"),
+  cep: z.string().regex(/^\d{5}-?\d{3}$/, "CEP inválido"),
   numero: z.string().min(1).max(20),
   cidade: z.string().min(2).max(100),
   rua: z.string().max(200).optional(),
   complemento: z.string().max(100).optional(),
 });
 
-// ─── Schema do webhook do Mercado Pago ────────────────────────────────────────
+export const updateOrderStatusSchema = z.object({
+  status: z.enum([
+    "RECEBIDO",
+    "PREPARANDO",
+    "PRONTO",
+    "SAIU_PARA_ENTREGA",
+    "ENTREGUE",
+  ]),
+});
+
 export const paymentWebhookSchema = z
   .object({
     id: z.union([z.string(), z.number()]).optional(),
-    type: z.string().optional(),
-    topic: z.string().optional(),
-    resource: z.union([z.string(), z.number()]).optional(),
+    type: z.string().optional(), // e.g. "payment", "point_integration_wh"
+    topic: z.string().optional(), // formato legado
+    resource: z.union([z.string(), z.number()]).optional(), // formato legado
     action: z.string().optional(),
     status: z.string().optional(),
     external_reference: z.string().optional(),
@@ -79,7 +69,7 @@ export const paymentWebhookSchema = z
         payment_id: z.union([z.string(), z.number()]).optional(),
         state: z.string().optional(),
         status: z.string().optional(),
-        external_reference: z.string().optional(),
+        external_reference: z.string().optional(), // nova API /v1/orders
         status_detail: z.string().optional(),
         metadata: z.record(z.any()).optional(),
       })

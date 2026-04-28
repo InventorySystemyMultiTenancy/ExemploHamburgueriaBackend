@@ -1,21 +1,19 @@
-import { Prisma } from "@prisma/client";
 import { MercadoPagoConfig, Payment as MPPayment } from "mercadopago";
+import { Prisma } from "@prisma/client";
 import { AppError } from "../errors/AppError.js";
-import { OrderRepository } from "../repositories/OrderRepository.js";
-import { ProductRepository } from "../repositories/ProductRepository.js";
-import { CouponRepository } from "../repositories/CouponRepository.js";
 import { prisma } from "../lib/prisma.js";
+import { OrderRepository } from "../repositories/OrderRepository.js";
+import { PaymentRepository } from "../repositories/PaymentRepository.js";
 import {
   emitOrderCreated,
   emitOrderStatusUpdated,
   emitPaymentUpdated,
 } from "../realtime/socketServer.js";
 
-// ─── Máquina de estados do pedido ────────────────────────────────────────────
 const ORDER_TRANSITIONS = {
-  RECEBIDO: ["EM_PREPARO", "CANCELADO"],
-  EM_PREPARO: ["PRONTO"],
-  PRONTO: ["SAIU_PARA_ENTREGA", "ENTREGUE"], // ENTREGUE direto para retirada
+  RECEBIDO: ["PREPARANDO"],
+  PREPARANDO: ["PRONTO"],
+  PRONTO: ["SAIU_PARA_ENTREGA"],
   SAIU_PARA_ENTREGA: ["ENTREGUE"],
   ENTREGUE: [],
   CANCELADO: [],
@@ -32,21 +30,24 @@ const PAYMENT_STATUS_MAP = {
 
 const toCents = (value) => Math.round(Number(value) * 100);
 const fromCents = (value) => (value / 100).toFixed(2);
+const startOfDay = (date) =>
+  new Date(date.getFullYear(), date.getMonth(), date.getDate());
+const startOfMonth = (date) => new Date(date.getFullYear(), date.getMonth(), 1);
+const isMercadoPagoInternalReference = (value) =>
+  !!value && /^INSTORE-/i.test(String(value));
 
 export class OrderService {
   constructor(
     orderRepository = new OrderRepository(),
-    productRepository = new ProductRepository(),
-    couponRepository = new CouponRepository(),
+    paymentRepository = new PaymentRepository(),
   ) {
     this.orderRepository = orderRepository;
-    this.productRepository = productRepository;
-    this.couponRepository = couponRepository;
+    this.paymentRepository = paymentRepository;
   }
 
-  // ─── Criar Pedido ─────────────────────────────────────────────────────────
   async createOrder({
     userId,
+    mesaId,
     deliveryAddress,
     notes,
     items,
@@ -55,124 +56,84 @@ export class OrderService {
     deliveryLat,
     deliveryLon,
     isPickup,
-    couponCode,
   }) {
-    if (!userId)
-      throw new AppError("Pedido deve ser vinculado a um usuario.", 422);
-    if (!items?.length)
-      throw new AppError("Pedido deve conter ao menos 1 item.", 422);
-
-    // ── Passo 1: Validar e precificar cada item ────────────────────────────
-    const validatedItems = [];
-
-    for (const item of items) {
-      if (item.comboId) {
-        const validated = await this.#validateComboItem(item);
-        validatedItems.push(validated);
-        continue;
-      }
-
-      if (item.productId) {
-        const validated = await this.#validateProductItem(item);
-        validatedItems.push(validated);
-        continue;
-      }
-
-      throw new AppError("Cada item deve ter productId ou comboId.", 422);
+    if (!userId && !mesaId) {
+      throw new AppError(
+        "Pedido deve ser vinculado a um usuario ou mesa.",
+        422,
+      );
     }
 
-    const subtotalCents = validatedItems.reduce(
-      (acc, i) => acc + i.totalPriceCents,
-      0,
-    );
-    const deliveryFeeCents = deliveryFee ? toCents(deliveryFee) : 0;
+    if (!items?.length) {
+      throw new AppError("Pedido deve conter ao menos 1 item.", 422);
+    }
 
-    // ── Passo 2: Validar cupom de desconto ────────────────────────────────
-    let discountCents = 0;
-    let coupon = null;
+    const order = await prisma.$transaction(async (tx) => {
+      const normalizedItems = [];
 
-    if (couponCode) {
-      coupon = await this.couponRepository.findByCode(couponCode);
-      if (!coupon) throw new AppError("Cupom nao encontrado.", 404);
-      if (!coupon.isActive) throw new AppError("Cupom inativo.", 422);
-      if (coupon.expiresAt && new Date() > coupon.expiresAt)
-        throw new AppError("Cupom expirado.", 422);
-      if (coupon.maxUses !== null && coupon.usedCount >= coupon.maxUses) {
-        throw new AppError("Cupom esgotado.", 422);
+      for (const item of items) {
+        const normalized = await this.#normalizeItemInTransaction(tx, item);
+        normalizedItems.push(normalized);
       }
-      if (coupon.minOrderValue) {
-        const minCents = toCents(coupon.minOrderValue);
-        if (subtotalCents < minCents) {
+
+      const totalCents = normalizedItems.reduce(
+        (acc, item) => acc + item.totalPriceCents,
+        0,
+      );
+
+      for (const item of normalizedItems) {
+        const decremented = await tx.product.updateMany({
+          where: {
+            id: item.productId,
+            isActive: true,
+            stock: {
+              gte: item.quantity,
+            },
+          },
+          data: {
+            stock: {
+              decrement: item.quantity,
+            },
+          },
+        });
+
+        if (decremented.count === 0) {
           throw new AppError(
-            `Pedido minimo para este cupom: R$ ${Number(coupon.minOrderValue).toFixed(2).replace(".", ",")}.`,
-            422,
+            `Estoque insuficiente para o produto ${item.productId}.`,
+            409,
           );
         }
       }
 
-      discountCents =
-        coupon.type === "PERCENTUAL"
-          ? Math.round(subtotalCents * (Number(coupon.value) / 100))
-          : toCents(coupon.value);
-
-      discountCents = Math.min(discountCents, subtotalCents);
-    }
-
-    const totalCents = subtotalCents - discountCents + deliveryFeeCents;
-
-    // ── Passo 3: Transação — checar estoque, descontar e criar pedido ──────
-    const order = await prisma.$transaction(async (tx) => {
-      // 3a. Validar e descontar estoque
-      await this.#deductStock(tx, validatedItems);
-
-      // 3b. Incrementar uso do cupom
-      if (coupon) {
-        await tx.coupon.update({
-          where: { id: coupon.id },
-          data: { usedCount: { increment: 1 } },
-        });
-      }
-
-      // 3c. Criar o pedido com itens e adicionais
       return tx.order.create({
         data: {
-          userId,
-          subtotal: new Prisma.Decimal(fromCents(subtotalCents)),
-          discount: new Prisma.Decimal(fromCents(discountCents)),
-          deliveryFee:
-            deliveryFee != null ? new Prisma.Decimal(deliveryFee) : null,
+          ...(userId ? { userId } : {}),
+          ...(mesaId ? { mesaId } : {}),
+          deliveryAddress: deliveryAddress ?? null,
+          notes,
           total: new Prisma.Decimal(fromCents(totalCents)),
           paymentStatus: "PENDENTE",
-          paymentMethod: paymentMethod ?? null,
-          deliveryAddress: deliveryAddress ?? null,
-          deliveryLat: deliveryLat ?? null,
-          deliveryLon: deliveryLon ?? null,
-          isPickup: isPickup ?? false,
-          notes: notes ?? null,
-          couponId: coupon?.id ?? null,
-          deliveryCode: isPickup
-            ? null
-            : String(Math.floor(1000 + Math.random() * 9000)),
+          ...(isPickup != null ? { isPickup } : {}),
+          ...(isPickup
+            ? {}
+            : {
+                deliveryCode: String(Math.floor(1000 + Math.random() * 9000)),
+              }),
+          ...(paymentMethod != null ? { paymentMethod } : {}),
+          ...(deliveryFee != null
+            ? { deliveryFee: new Prisma.Decimal(deliveryFee) }
+            : {}),
+          ...(deliveryLat != null ? { deliveryLat } : {}),
+          ...(deliveryLon != null ? { deliveryLon } : {}),
           items: {
-            create: validatedItems.map((item) => ({
-              productId: item.productId ?? null,
-              comboId: item.comboId ?? null,
+            create: normalizedItems.map((item) => ({
               quantity: item.quantity,
               unitPrice: new Prisma.Decimal(fromCents(item.unitPriceCents)),
               totalPrice: new Prisma.Decimal(fromCents(item.totalPriceCents)),
+              productId: item.productId,
+              addons: item.addons,
+              removedIngredients: item.removedIngredients,
               notes: item.notes ?? null,
-              meatDoneness: item.meatDoneness ?? null,
-              removedIngredients: item.removedIngredients ?? [],
-              addons: {
-                create: (item.addons ?? []).map((a) => ({
-                  addonId: a.addonId,
-                  quantity: a.quantity,
-                  unitPrice: new Prisma.Decimal(fromCents(a.unitPriceCents)),
-                  totalPrice: new Prisma.Decimal(
-                    fromCents(a.unitPriceCents * a.quantity),
-                  ),
-                })),
-              },
             })),
           },
           payment: {
@@ -180,21 +141,23 @@ export class OrderService {
               provider: "MERCADO_PAGO",
               amount: new Prisma.Decimal(fromCents(totalCents)),
               status: "PENDENTE",
-              payload: { paymentMethod: paymentMethod || "nao_informado" },
+              payload: {
+                paymentMethod: paymentMethod || "nao_informado",
+              },
             },
           },
         },
         include: {
-          items: {
-            include: {
-              addons: { include: { addon: true } },
-              product: true,
-              combo: true,
+          items: true,
+          payment: true,
+          user: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              role: true,
             },
           },
-          payment: true,
-          user: { select: { id: true, name: true, email: true } },
-          coupon: true,
         },
       });
     });
@@ -202,6 +165,7 @@ export class OrderService {
     emitOrderCreated({
       orderId: order.id,
       userId: order.userId,
+      mesaId: order.mesaId,
       status: order.status,
       total: Number(order.total),
     });
@@ -209,156 +173,92 @@ export class OrderService {
     return order;
   }
 
-  // ─── Cancelar Pedido ──────────────────────────────────────────────────────
   async cancelOrder(orderId) {
     const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
-    if (order.status === "ENTREGUE")
-      throw new AppError("Pedido ja entregue nao pode ser cancelado.", 409);
-    if (order.status === "CANCELADO")
-      throw new AppError("Pedido ja esta cancelado.", 409);
 
-    const updated = await this.orderRepository.updateStatus(
+    if (!order) {
+      throw new AppError("Pedido nao encontrado.", 404);
+    }
+
+    if (order.status === "ENTREGUE") {
+      throw new AppError("Pedido ja entregue nao pode ser cancelado.", 409);
+    }
+
+    if (order.status === "CANCELADO") {
+      throw new AppError("Pedido ja esta cancelado.", 409);
+    }
+
+    const updatedOrder = await this.orderRepository.updateStatus(
       orderId,
       "CANCELADO",
     );
 
     emitOrderStatusUpdated({
-      orderId: updated.id,
+      orderId: updatedOrder.id,
       userId: order.userId,
       previousStatus: order.status,
       status: "CANCELADO",
+      paymentWasPending: order.paymentStatus === "PENDENTE",
     });
 
-    return updated;
+    return updatedOrder;
   }
 
-  // ─── Atualizar Status ─────────────────────────────────────────────────────
   async updateOrderStatus(orderId, nextStatus) {
     const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
 
-    const allowed = ORDER_TRANSITIONS[order.status] ?? [];
-    if (!allowed.includes(nextStatus)) {
+    if (!order) {
+      throw new AppError("Pedido nao encontrado.", 404);
+    }
+
+    const allowedTransitions = ORDER_TRANSITIONS[order.status] ?? [];
+
+    if (!allowedTransitions.includes(nextStatus)) {
       throw new AppError(
         `Transicao invalida de ${order.status} para ${nextStatus}.`,
         409,
       );
     }
 
+    if (nextStatus === "SAIU_PARA_ENTREGA" && !order.assignedMotoboyId) {
+      throw new AppError(
+        "Selecione um motoboy antes de enviar para entrega.",
+        422,
+      );
+    }
+
     const deliveredAt = nextStatus === "ENTREGUE" ? new Date() : null;
-    const updated = await this.orderRepository.updateStatus(
+    const updatedOrder = await this.orderRepository.updateStatus(
       orderId,
       nextStatus,
       deliveredAt,
     );
 
     emitOrderStatusUpdated({
-      orderId: updated.id,
+      orderId: updatedOrder.id,
       userId: order.userId,
       previousStatus: order.status,
-      status: nextStatus,
+      status: updatedOrder.status,
     });
 
-    return updated;
+    return updatedOrder;
   }
 
-  // ─── Consultas ────────────────────────────────────────────────────────────
-
-  async getOrderById(orderId) {
-    const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
-    return order;
-  }
-
-  async listOrdersByUser(userId) {
-    return this.orderRepository.findByUserId(userId);
-  }
-
-  async listActiveOrders() {
-    return this.orderRepository.findActive();
-  }
-
-  async motoboyOrders() {
-    return this.orderRepository.findMotoboyOrders();
-  }
-
-  async history(filters) {
-    return this.orderRepository.findHistory(filters);
-  }
-
-  async analytics() {
-    return this.orderRepository.getAnalytics();
-  }
-
-  // ─── Atribuir Motoboy ────────────────────────────────────────────────────
-  async assignMotoboy(orderId, motoboyId) {
-    const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
-    await this.orderRepository.assignMotoboy(orderId, motoboyId);
-    return this.orderRepository.findById(orderId);
-  }
-
-  // ─── Confirmar Entrega ────────────────────────────────────────────────────
-  async confirmDelivery(orderId, deliveryCode) {
-    const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
-
-    if (!order.isPickup && order.deliveryCode) {
-      if (order.deliveryCode !== String(deliveryCode)) {
-        throw new AppError("Codigo de entrega incorreto.", 422);
-      }
-    }
-
-    return this.updateOrderStatus(orderId, "ENTREGUE");
-  }
-
-  // ─── Deletar Pedido ───────────────────────────────────────────────────────
-  async deleteOrder(orderId, requestingUserId) {
-    const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
-
-    if (order.userId && order.userId !== requestingUserId) {
-      throw new AppError(
-        "Voce nao pode excluir pedidos de outros usuarios.",
-        403,
-      );
-    }
-
-    if (!["CANCELADO", "ENTREGUE"].includes(order.status)) {
-      throw new AppError(
-        "Apenas pedidos Cancelados ou Entregues podem ser excluidos.",
-        409,
-      );
-    }
-
-    return this.orderRepository.delete(orderId);
-  }
-
-  // ─── Atualizar Status de Pagamento (admin) ────────────────────────────────
-  async adminUpdatePaymentStatus(orderId, paymentStatus) {
-    const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
-
-    await this.orderRepository.updatePaymentStatus(orderId, paymentStatus);
-
-    emitPaymentUpdated({
-      orderId,
-      userId: order.userId,
-      paymentStatus,
-    });
-  }
-
-  // ─── Webhook do Mercado Pago ──────────────────────────────────────────────
   async handlePaymentWebhook(payload) {
-    const isOrderWebhook = payload?.type === "order";
+    // Formatos suportados:
+    // 1. Nova API /v1/orders (MP Point):  { type: "order", action: "order.processed", data: { id: "ORD...", external_reference: "...", status: "processed" } }
+    // 2. MP Point legado:                 { type: "point_integration_wh", data: { id: "<intent_id>", payment_id: 123 } }
+    // 3. Checkout/PIX (novo):             { type: "payment", data: { id: "<payment_id>" } }
+    // 4. Formato antigo (legado):         { resource: "123456", topic: "payment" }
+
+    const isOrderWebhook = payload?.type === "order"; // nova API /v1/orders
     const isPointWebhook = payload?.type === "point_integration_wh";
     const isLegacyWebhook =
       !!payload?.topic && !!payload?.resource && !payload?.type;
 
     let providerStatus = "pending";
     let orderId =
-      payload?.data?.external_reference ??
+      payload?.data?.external_reference ?? // nova API /v1/orders
       payload?.external_reference ??
       payload?.additional_info?.external_reference ??
       payload?.data?.metadata?.order_id ??
@@ -368,184 +268,427 @@ export class OrderService {
     const mpToken = process.env.MP_ACCESS_TOKEN;
 
     if (isOrderWebhook) {
+      // Nova API /v1/orders — o payload já tem tudo que precisamos
+      const action = payload?.action ?? "";
       const orderData = payload?.data ?? {};
       externalId = String(orderData.id ?? "");
       orderId = orderId || orderData.external_reference;
 
-      const mpOrderStatus = String(orderData.status ?? "").toLowerCase();
+      console.log(
+        "[webhook] Nova API /v1/orders. action:",
+        action,
+        "| orderId:",
+        orderId,
+        "| status:",
+        orderData.status,
+      );
 
-      if (
-        mpOrderStatus === "processed" ||
-        mpOrderStatus === "payment_required"
-      ) {
+      // Mapeia status da order para providerStatus
+      if (action === "order.processed" || orderData.status === "processed") {
         providerStatus = "approved";
-      } else if (["cancelled", "expired"].includes(mpOrderStatus)) {
+      } else if (
+        action === "order.canceled" ||
+        orderData.status === "canceled" ||
+        orderData.status === "expired"
+      ) {
         providerStatus = "cancelled";
+      } else if (action === "order.failed" || orderData.status === "failed") {
+        providerStatus = "rejected";
+      } else if (
+        action === "order.refunded" ||
+        orderData.status === "refunded"
+      ) {
+        providerStatus = "refunded";
       } else {
+        // order.action_required, at_terminal, created — ainda processando
         providerStatus = "pending";
       }
+    } else if (isLegacyWebhook) {
+      // Formato antigo: { resource: "156011841118", topic: "payment" }
+      // resource pode ser um número ou URL como /v1/payments/123456
+      const rawResource = String(payload.resource ?? "");
+      const rawPaymentId = rawResource.replace(/\D/g, "") || rawResource;
+      externalId = rawPaymentId;
 
-      if (!orderId && externalId && mpToken) {
+      console.log(
+        "[webhook] Formato antigo. topic:",
+        payload.topic,
+        "paymentId:",
+        rawPaymentId,
+      );
+
+      if (rawPaymentId && mpToken) {
         try {
-          const response = await fetch(
-            `https://api.mercadopago.com/v1/orders/${externalId}`,
-            { headers: { Authorization: `Bearer ${mpToken}` } },
+          const client = new MercadoPagoConfig({ accessToken: mpToken });
+          const paymentApi = new MPPayment(client);
+          const paymentData = await paymentApi.get({ id: rawPaymentId });
+          providerStatus = (paymentData.status ?? "pending").toLowerCase();
+          const rawRef =
+            paymentData.external_reference ||
+            paymentData.additional_info?.external_reference;
+          // Ignora referências internas do MP (ex: "INSTORE-...") — não são nosso orderId
+          const isInternalRef = rawRef && /^INSTORE-/i.test(String(rawRef));
+          orderId = orderId || (isInternalRef ? null : rawRef);
+          externalId = String(paymentData.id ?? rawPaymentId);
+          console.log(
+            "[webhook] Legacy payment status:",
+            providerStatus,
+            "orderId:",
+            orderId,
+            "ext_ref:",
+            paymentData.external_reference,
+            "additional_info:",
+            JSON.stringify(paymentData.additional_info),
           );
-          const mpOrder = await response.json();
-          orderId = mpOrder?.external_reference;
-          externalId = String(mpOrder?.id ?? externalId);
-        } catch (err) {
-          console.error("[webhook] Falha ao buscar /v1/orders:", err.message);
+
+          console.log(
+            "[webhook] paymentData.order:",
+            JSON.stringify(paymentData.order),
+          );
+
+          if (!orderId) {
+            orderId = await this.#findOrderIdByTerminalReferences(paymentData);
+          }
+
+          // Fallback: busca a Order da nova API /v1/orders usando o order.id do pagamento
+          // Isso resolve o caso em que a maquininha (Point) paga via /v1/orders mas o
+          // webhook chega no formato legado com external_reference=null
+          if (!orderId) {
+            const mpOrderId =
+              paymentData?.order?.id != null
+                ? String(paymentData.order.id)
+                : null;
+            console.log(
+              "[webhook] Tentando fallback via /v1/orders com mpOrderId:",
+              mpOrderId,
+            );
+            if (mpOrderId && mpToken) {
+              try {
+                // 1. Tenta buscar diretamente na nova API /v1/orders/{id}
+                const orderResp = await fetch(
+                  `https://api.mercadopago.com/v1/orders/${mpOrderId}`,
+                  { headers: { Authorization: `Bearer ${mpToken}` } },
+                );
+                if (orderResp.ok) {
+                  const mpOrder = await orderResp.json();
+                  const extRef = mpOrder.external_reference;
+                  console.log(
+                    "[webhook] /v1/orders extRef:",
+                    extRef,
+                    "status:",
+                    mpOrder.status,
+                  );
+                  if (extRef && !isMercadoPagoInternalReference(extRef)) {
+                    orderId = extRef;
+                    console.log(
+                      "[webhook] orderId recuperado via /v1/orders:",
+                      orderId,
+                    );
+                  }
+                }
+
+                // 2. Se ainda não encontrou, tenta por terminalIntentId no banco
+                if (!orderId) {
+                  const orderByIntent =
+                    await this.orderRepository.findByTerminalIntentId?.(
+                      mpOrderId,
+                    );
+                  if (orderByIntent?.id) {
+                    orderId = orderByIntent.id;
+                    console.log(
+                      "[webhook] orderId recuperado via terminalIntentId:",
+                      orderId,
+                    );
+                  }
+                }
+              } catch (fe) {
+                console.warn(
+                  "[webhook] Falha no fallback /v1/orders:",
+                  fe.message,
+                );
+              }
+            }
+          }
+
+          // Último recurso: pagamento aprovado da maquininha sem external_reference.
+          // Busca o pedido PENDENTE mais recente com terminalIntentId que bate com o valor.
+          if (!orderId && providerStatus === "approved") {
+            const txAmount = paymentData?.transaction_amount;
+            if (txAmount != null) {
+              const amountCents = toCents(txAmount);
+              const orderByAmount =
+                await this.orderRepository.findPendingTerminalOrderByAmount?.(
+                  amountCents,
+                );
+              if (orderByAmount?.id) {
+                orderId = orderByAmount.id;
+                console.log(
+                  "[webhook] orderId recuperado por valor do pagamento:",
+                  orderId,
+                  "| amount:",
+                  txAmount,
+                );
+              } else {
+                console.warn(
+                  "[webhook] Sem pedido pendente da maquininha com valor R$",
+                  txAmount,
+                  "— payload ignorado.",
+                );
+              }
+            }
+          }
+        } catch (e) {
+          console.error("[webhook] Falha ao buscar payment legado:", e.message);
         }
       }
     } else if (isPointWebhook) {
-      const data = payload?.data ?? {};
-      externalId = String(data.id ?? "");
-      const paymentId = String(data.payment_id ?? "");
+      // Para pagamentos da maquininha:
+      // 1. Buscar o intent para pegar external_reference e estado
+      // 2. Se houver payment_id, buscar o pagamento para confirmar status
+      const intentId = payload?.data?.id;
+      const paymentId = payload?.data?.payment_id;
 
-      if (paymentId && mpToken) {
+      console.log(
+        "[webhook] Point webhook. intentId:",
+        intentId,
+        "paymentId:",
+        paymentId,
+      );
+
+      if (intentId && mpToken) {
         try {
-          const client = new MercadoPagoConfig({ accessToken: mpToken });
-          const mpPaymentApi = new MPPayment(client);
-          const paymentData = await mpPaymentApi.get({ id: paymentId });
-          providerStatus = paymentData.status ?? "pending";
-          externalId = paymentId;
-          orderId = orderId || paymentData.external_reference;
-
-          if (!orderId) {
-            const foundByIntent =
-              await this.orderRepository.findByTerminalIntentId(externalId);
-            if (foundByIntent) orderId = foundByIntent.id;
-          }
-
-          if (!orderId) {
-            const amountCents = Math.round(
-              (paymentData.transaction_amount ?? 0) * 100,
-            );
-            const foundByAmount =
-              await this.orderRepository.findPendingTerminalOrderByAmount(
-                amountCents,
-              );
-            if (foundByAmount) orderId = foundByAmount.id;
-          }
-        } catch (err) {
-          console.error(
-            "[webhook] Falha ao buscar pagamento Point:",
-            err.message,
+          const intentResp = await fetch(
+            `https://api.mercadopago.com/point/integration-api/payment-intents/${intentId}`,
+            { headers: { Authorization: `Bearer ${mpToken}` } },
           );
+          const intentData = await intentResp.json();
+          // external_reference está na raiz do intent (ou em additional_info para intents antigos)
+          orderId =
+            orderId ||
+            intentData?.external_reference ||
+            intentData?.additional_info?.external_reference;
+          console.log(
+            "[webhook] intent state:",
+            intentData?.state,
+            "| external_reference:",
+            intentData?.external_reference,
+            "| additional_info.ext_ref:",
+            intentData?.additional_info?.external_reference,
+          );
+        } catch (e) {
+          console.error("[webhook] Falha ao buscar intent:", e.message);
         }
       }
-    } else if (isLegacyWebhook || payload?.type === "payment") {
-      const paymentId = String(
-        payload?.data?.id ?? payload?.id ?? payload?.resource ?? "",
-      );
-      externalId = paymentId;
 
       if (paymentId && mpToken) {
         try {
           const client = new MercadoPagoConfig({ accessToken: mpToken });
-          const mpPaymentApi = new MPPayment(client);
-          const paymentData = await mpPaymentApi.get({ id: paymentId });
-          providerStatus = paymentData.status ?? "pending";
+          const paymentApi = new MPPayment(client);
+          const paymentData = await paymentApi.get({ id: String(paymentId) });
+          providerStatus = (paymentData.status ?? "pending").toLowerCase();
           orderId = orderId || paymentData.external_reference;
-        } catch (err) {
-          console.error("[webhook] Falha ao buscar pagamento:", err.message);
+          externalId = String(paymentData.id ?? paymentId);
+          console.log(
+            "[webhook] Point payment status:",
+            providerStatus,
+            "orderId:",
+            orderId,
+          );
+        } catch (e) {
+          console.error("[webhook] Falha ao buscar payment:", e.message);
+          // Derivar status do state do intent apenas como fallback seguro
+          const state = String(payload?.data?.state ?? "").toUpperCase();
+          if (state === "CANCELED" || state === "CANCELLED")
+            providerStatus = "cancelled";
+          // Não assume approved para FINISHED — o status real virá do pagamento real
+          else providerStatus = "pending";
+          externalId = String(paymentId ?? intentId ?? "");
         }
+      } else {
+        // Sem payment_id ainda — verifica pelo external_reference se FINISHED
+        const state = String(payload?.data?.state ?? "").toUpperCase();
+        if (state === "CANCELED" || state === "CANCELLED") {
+          providerStatus = "cancelled";
+        } else if (state === "FINISHED" && orderId) {
+          // Busca o pagamento real pelo external_reference para confirmar status
+          try {
+            const searchUrl = `https://api.mercadopago.com/v1/payments/search?external_reference=${orderId}`;
+            const searchResp = await fetch(searchUrl, {
+              headers: { Authorization: `Bearer ${mpToken}` },
+            });
+            if (searchResp.ok) {
+              const searchData = await searchResp.json();
+              const latestPayment = searchData?.results?.[0];
+              if (latestPayment) {
+                providerStatus = (
+                  latestPayment.status ?? "pending"
+                ).toLowerCase();
+                externalId = String(latestPayment.id ?? "");
+                console.log(
+                  "[webhook] FINISHED buscado via search, status real:",
+                  providerStatus,
+                );
+              } else {
+                providerStatus = "pending";
+              }
+            } else {
+              providerStatus = "pending";
+            }
+          } catch (se) {
+            console.error(
+              "[webhook] Falha ao buscar pagamento FINISHED:",
+              se.message,
+            );
+            providerStatus = "pending";
+          }
+        } else {
+          providerStatus = "pending";
+        }
+        externalId = String(intentId ?? "");
+        console.log(
+          "[webhook] Point sem payment_id, state:",
+          state,
+          "-> providerStatus:",
+          providerStatus,
+        );
+      }
+    } else {
+      // Webhook normal de pagamento (PIX / checkout)
+      const rawPaymentId = payload?.data?.id ?? payload?.id;
+      externalId = String(rawPaymentId ?? "");
+
+      if (rawPaymentId && mpToken) {
+        try {
+          const client = new MercadoPagoConfig({ accessToken: mpToken });
+          const paymentApi = new MPPayment(client);
+          const paymentData = await paymentApi.get({
+            id: String(rawPaymentId),
+          });
+          providerStatus = (paymentData.status ?? "pending").toLowerCase();
+          orderId = orderId || paymentData.external_reference;
+          externalId = String(paymentData.id ?? rawPaymentId);
+        } catch {
+          // fall through with defaults
+        }
+      } else {
+        providerStatus = String(
+          payload?.data?.status ?? payload?.status ?? "pending",
+        ).toLowerCase();
       }
     }
 
+    const paymentStatus = PAYMENT_STATUS_MAP[providerStatus] ?? "PENDENTE";
+
     if (!orderId) {
+      // Pode ser um pagamento externo ao sistema (ex: INSTORE do MP) — ignora silenciosamente
       console.warn(
-        "[webhook] orderId nao resolvido. Payload:",
+        "[webhook] Sem orderId identificável. Payload ignorado:",
         JSON.stringify(payload),
       );
-      return;
+      return { orderId: null, paymentStatus: null, ignored: true };
     }
 
     const order = await this.orderRepository.findById(orderId);
+
     if (!order) {
-      console.warn("[webhook] Pedido nao encontrado:", orderId);
-      return;
+      throw new AppError("Pedido nao encontrado para o webhook recebido.", 404);
     }
 
-    const newPaymentStatus = PAYMENT_STATUS_MAP[providerStatus] ?? "PENDENTE";
-
-    if (
-      order.paymentStatus === "APROVADO" &&
-      newPaymentStatus !== "ESTORNADO"
-    ) {
-      console.log("[webhook] Pedido ja aprovado. Ignorando.");
-      return;
-    }
-
-    await this.orderRepository.updatePaymentStatus(orderId, newPaymentStatus);
-    await this.orderRepository.updatePaymentRecord(orderId, {
-      externalId,
-      status: newPaymentStatus,
-      payload: { providerStatus, source: payload?.type || "legacy" },
+    await this.paymentRepository.upsertFromWebhook({
+      orderId,
+      externalId: externalId || null,
+      status: paymentStatus,
+      payload,
+      amount: order.total,
     });
 
-    console.log(`[webhook] Pedido ${orderId} → pagamento ${newPaymentStatus}`);
+    await this.orderRepository.updatePaymentStatus(orderId, paymentStatus);
+    console.log(
+      `[webhook] ✅ Pedido ${orderId} atualizado para paymentStatus=${paymentStatus} (providerStatus=${providerStatus})`,
+    );
 
     emitPaymentUpdated({
       orderId,
       userId: order.userId,
-      paymentStatus: newPaymentStatus,
+      paymentStatus,
     });
+
+    return {
+      orderId,
+      paymentStatus,
+    };
   }
 
-  // ─── Confirmar Pagamento Checkout Pro (retorno do MP) ─────────────────────
-  async confirmCheckoutPayment(orderId, paymentId, requestingUser) {
+  async adminSetPaymentStatus(orderId, paymentStatus) {
     const order = await this.orderRepository.findById(orderId);
-    if (!order) throw new AppError("Pedido nao encontrado.", 404);
+    if (!order) throw new AppError("Pedido não encontrado.", 404);
+    return this.orderRepository.updatePaymentStatus(orderId, paymentStatus);
+  }
 
-    if (
-      requestingUser.role === "CLIENTE" &&
-      order.userId !== requestingUser.id
-    ) {
+  /**
+   * Confirmação explícita de pagamento do Checkout Pro.
+   * Chamado pelo CheckoutReturnPage quando o MP redireciona de volta com
+   * ?status=approved&payment_id=XXX&external_reference=ORDER_ID.
+   * Garante que o pedido seja marcado como APROVADO mesmo quando o webhook
+   * falha por ter external_reference nulo.
+   */
+  async confirmCheckoutPayment(orderId, paymentId, user) {
+    const order = await this.orderRepository.findById(orderId);
+    if (!order) throw new AppError("Pedido não encontrado.", 404);
+
+    // Verifica propriedade: CLIENTE só confirma o próprio pedido
+    if (user.role === "CLIENTE" && order.userId !== user.id) {
       throw new AppError("Acesso negado.", 403);
     }
 
     if (order.paymentStatus === "APROVADO") {
-      return order;
+      // Já está pago — retorna sem fazer nada
+      return { orderId, paymentStatus: "APROVADO", alreadyPaid: true };
     }
 
     const mpToken = process.env.MP_ACCESS_TOKEN;
-    if (!mpToken) throw new AppError("Mercado Pago nao configurado.", 500);
+    if (!mpToken) throw new AppError("Mercado Pago não configurado.", 500);
 
     const client = new MercadoPagoConfig({ accessToken: mpToken });
-    const mpPaymentApi = new MPPayment(client);
-    const paymentData = await mpPaymentApi.get({ id: paymentId });
+    const paymentApi = new MPPayment(client);
+    const payment = await paymentApi.get({ id: String(paymentId) });
 
-    if (paymentData.status !== "approved") {
-      throw new AppError(
-        `Pagamento nao aprovado (status: ${paymentData.status}).`,
-        409,
-      );
+    console.log(
+      `[confirmCheckout] paymentId=${paymentId} status=${payment.status} ext_ref=${payment.external_reference}`,
+    );
+
+    if (payment.status !== "approved" && payment.status !== "authorized") {
+      return {
+        orderId,
+        paymentStatus: PAYMENT_STATUS_MAP[payment.status] ?? "PENDENTE",
+        alreadyPaid: false,
+      };
     }
 
-    const extRef = paymentData.external_reference;
-    if (extRef && extRef !== orderId) {
-      throw new AppError("Pagamento nao corresponde a este pedido.", 409);
+    // Verificação de segurança: se o MP retornou external_reference,
+    // ele deve bater com o orderId informado.
+    if (payment.external_reference && payment.external_reference !== orderId) {
+      throw new AppError("Referência do pagamento inválida.", 422);
     }
 
-    if (!extRef) {
-      const paidCents = Math.round((paymentData.transaction_amount ?? 0) * 100);
-      const orderCents = toCents(order.total);
-      if (Math.abs(paidCents - orderCents) > 1) {
-        throw new AppError(
-          "Valor do pagamento nao corresponde ao pedido.",
-          409,
-        );
+    // Se external_reference é nulo (bug do MP), valida pelo valor do pedido
+    if (!payment.external_reference) {
+      const mpAmountCents = toCents(payment.transaction_amount);
+      const orderAmountCents = toCents(order.total);
+      if (Math.abs(mpAmountCents - orderAmountCents) > 1) {
+        throw new AppError("Valor do pagamento não confere com o pedido.", 422);
       }
     }
 
-    await this.orderRepository.updatePaymentStatus(orderId, "APROVADO");
-    await this.orderRepository.updatePaymentRecord(orderId, {
-      externalId: String(paymentId),
+    await this.paymentRepository.upsertFromWebhook({
+      orderId,
+      externalId: String(payment.id),
       status: "APROVADO",
-      payload: { confirmed: true, paymentId: String(paymentId) },
+      payload: payment,
+      amount: order.total,
     });
+
+    await this.orderRepository.updatePaymentStatus(orderId, "APROVADO");
 
     emitPaymentUpdated({
       orderId,
@@ -553,164 +696,440 @@ export class OrderService {
       paymentStatus: "APROVADO",
     });
 
-    return this.orderRepository.findById(orderId);
+    console.log(`[confirmCheckout] ✅ Pedido ${orderId} marcado como APROVADO`);
+
+    return { orderId, paymentStatus: "APROVADO", alreadyPaid: false };
   }
 
-  // ─── Salvar intentId da maquininha ────────────────────────────────────────
-  async saveTerminalIntentId(orderId, intentId) {
-    return this.orderRepository.saveTerminalIntentId(orderId, intentId);
+  async listOrdersByUser(userId) {
+    return this.orderRepository.findByUserId(userId);
   }
 
-  // ─── Helpers privados ─────────────────────────────────────────────────────
+  async listMotoboyOrders(user) {
+    if (user?.role === "MOTOBOY") {
+      return this.orderRepository.findForMotoboy({
+        assignedMotoboyId: user.id,
+      });
+    }
 
-  async #validateProductItem(item) {
-    const product = await prisma.product.findFirst({
-      where: { id: item.productId, isActive: true, isAvailable: true },
+    return this.orderRepository.findForMotoboy();
+  }
+
+  async listActiveOrders() {
+    const orders = await this.orderRepository.findAllActive();
+    return orders.filter((o) => o.status !== "CANCELADO");
+  }
+
+  async listOrderHistory({ clientName, dateFrom, dateTo } = {}) {
+    return this.orderRepository.findAllHistory({
+      clientName,
+      dateFrom,
+      dateTo,
     });
-    if (!product) {
-      throw new AppError(
-        `Produto ${item.productId} nao encontrado ou indisponivel.`,
-        422,
-      );
-    }
-
-    if (item.meatDoneness && !product.isBurger) {
-      throw new AppError(
-        `Produto "${product.name}" nao suporta ponto da carne.`,
-        422,
-      );
-    }
-
-    // Validar adicionais vinculados ao produto
-    let addonsTotalCents = 0;
-    const resolvedAddons = [];
-
-    for (const addonReq of item.addons ?? []) {
-      const pa = await prisma.productAddon.findFirst({
-        where: { productId: product.id, addonId: addonReq.addonId },
-        include: { addon: true },
-      });
-      if (!pa || !pa.addon.isActive) {
-        throw new AppError(
-          `Adicional ${addonReq.addonId} nao disponivel para este produto.`,
-          422,
-        );
-      }
-      const qty = addonReq.quantity ?? 1;
-      const unitPriceCents = toCents(pa.addon.price);
-      addonsTotalCents += unitPriceCents * qty;
-      resolvedAddons.push({
-        addonId: pa.addon.id,
-        quantity: qty,
-        unitPriceCents,
-      });
-    }
-
-    const quantity = item.quantity ?? 1;
-    const productUnitCents = toCents(product.basePrice);
-    const unitPriceCents = productUnitCents + addonsTotalCents;
-
-    return {
-      type: "PRODUCT",
-      productId: product.id,
-      comboId: null,
-      quantity,
-      unitPriceCents,
-      totalPriceCents: unitPriceCents * quantity,
-      notes: item.notes ?? null,
-      meatDoneness: item.meatDoneness ?? null,
-      removedIngredients: item.removedIngredients ?? [],
-      addons: resolvedAddons,
-      // Para controle de estoque
-      _productIds: [product.id],
-    };
   }
 
-  async #validateComboItem(item) {
-    const combo = await prisma.combo.findFirst({
-      where: { id: item.comboId, isActive: true },
-      include: { parts: { include: { product: true } } },
-    });
-    if (!combo) {
-      throw new AppError(
-        `Combo ${item.comboId} nao encontrado ou inativo.`,
-        422,
+  async getSalesAnalytics({ from, to } = {}) {
+    const orders = await this.orderRepository.findAllForAnalytics();
+    const now = new Date();
+    const todayStart = startOfDay(now);
+    const monthStart = startOfMonth(now);
+
+    // Build date range
+    let rangeStart = null;
+    let rangeEnd = null;
+    if (from) {
+      rangeStart = new Date(from);
+      rangeEnd = new Date(to ?? now);
+      rangeEnd.setHours(23, 59, 59, 999);
+    }
+
+    // All paid orders (unfiltered) — used for today/month sub-metrics
+    const allPaidOrders = orders.filter(
+      (order) => order.paymentStatus === "APROVADO",
+    );
+
+    // Paid orders filtered to the selected period — used for main totals
+    const paidOrders = rangeStart
+      ? allPaidOrders.filter((o) => {
+          const d = new Date(o.createdAt);
+          return d >= rangeStart && d <= rangeEnd;
+        })
+      : allPaidOrders;
+
+    const filteredOrders = rangeStart
+      ? orders.filter((o) => {
+          const d = new Date(o.createdAt);
+          return d >= rangeStart && d <= rangeEnd;
+        })
+      : orders;
+
+    const paidToday = allPaidOrders.filter(
+      (order) => new Date(order.createdAt) >= todayStart,
+    );
+    const paidThisMonth = allPaidOrders.filter(
+      (order) => new Date(order.createdAt) >= monthStart,
+    );
+
+    // Calcula custo total de um pedido: soma costPrice * quantity de cada item
+    const orderCost = (order) =>
+      (order.items ?? []).reduce(
+        (sum, item) =>
+          sum + Number(item.costPrice ?? 0) * Number(item.quantity ?? 1),
+        0,
       );
-    }
 
-    let addonsTotalCents = 0;
-    const resolvedAddons = [];
+    const totalRevenue = paidOrders.reduce(
+      (sum, o) => sum + Number(o.total),
+      0,
+    );
+    const totalCost = paidOrders.reduce((sum, o) => sum + orderCost(o), 0);
 
-    for (const addonReq of item.addons ?? []) {
-      const addon = await prisma.addon.findFirst({
-        where: { id: addonReq.addonId, isActive: true },
-      });
-      if (!addon) {
-        throw new AppError(
-          `Adicional ${addonReq.addonId} nao encontrado.`,
-          422,
-        );
+    const revenueToday = paidToday.reduce((sum, o) => sum + Number(o.total), 0);
+    const costToday = paidToday.reduce((sum, o) => sum + orderCost(o), 0);
+
+    const revenueThisMonth = paidThisMonth.reduce(
+      (sum, o) => sum + Number(o.total),
+      0,
+    );
+    const costThisMonth = paidThisMonth.reduce(
+      (sum, o) => sum + orderCost(o),
+      0,
+    );
+
+    const averageTicket = paidOrders.length
+      ? totalRevenue / paidOrders.length
+      : 0;
+
+    const statusCounts = filteredOrders.reduce((acc, order) => {
+      acc[order.status] = (acc[order.status] ?? 0) + 1;
+      return acc;
+    }, {});
+
+    // Determine chart range and grouping
+    const last7DaysStart = new Date(todayStart);
+    last7DaysStart.setDate(last7DaysStart.getDate() - 6);
+    const chartFrom = rangeStart ?? last7DaysStart;
+    const chartToDate =
+      rangeEnd ??
+      (() => {
+        const d = new Date(now);
+        d.setHours(23, 59, 59, 999);
+        return d;
+      })();
+    const diffDays = Math.ceil(
+      (chartToDate - chartFrom) / (1000 * 60 * 60 * 24),
+    );
+    const groupByMonth = diffDays > 60;
+
+    const salesMap = new Map();
+    if (groupByMonth) {
+      const cur = new Date(chartFrom.getFullYear(), chartFrom.getMonth(), 1);
+      const end = new Date(
+        chartToDate.getFullYear(),
+        chartToDate.getMonth(),
+        1,
+      );
+      while (cur <= end) {
+        const key = `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, "0")}`;
+        salesMap.set(key, { revenue: 0, cost: 0 });
+        cur.setMonth(cur.getMonth() + 1);
       }
-      const qty = addonReq.quantity ?? 1;
-      const unitPriceCents = toCents(addon.price);
-      addonsTotalCents += unitPriceCents * qty;
-      resolvedAddons.push({ addonId: addon.id, quantity: qty, unitPriceCents });
-    }
-
-    const quantity = item.quantity ?? 1;
-    const comboUnitCents = toCents(combo.promotionalPrice);
-    const unitPriceCents = comboUnitCents + addonsTotalCents;
-
-    return {
-      type: "COMBO",
-      productId: null,
-      comboId: combo.id,
-      quantity,
-      unitPriceCents,
-      totalPriceCents: unitPriceCents * quantity,
-      notes: item.notes ?? null,
-      meatDoneness: null,
-      removedIngredients: [],
-      addons: resolvedAddons,
-      // Produtos dos combo parts para controle de estoque
-      _productIds: combo.parts.flatMap((p) =>
-        Array(p.quantity).fill(p.productId),
-      ),
-    };
-  }
-
-  async #deductStock(tx, validatedItems) {
-    // Agrupa todos os productIds necessários
-    const productQtyMap = new Map(); // productId → total quantity
-
-    for (const item of validatedItems) {
-      for (const pid of item._productIds) {
-        const qty = (productQtyMap.get(pid) ?? 0) + item.quantity;
-        productQtyMap.set(pid, qty);
+      for (const order of paidOrders) {
+        const d = new Date(order.createdAt);
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+        if (salesMap.has(key)) {
+          const entry = salesMap.get(key);
+          entry.revenue += Number(order.total);
+          entry.cost += orderCost(order);
+        }
+      }
+    } else {
+      const cur = new Date(chartFrom);
+      cur.setHours(0, 0, 0, 0);
+      while (cur <= chartToDate) {
+        const key = cur.toISOString().slice(0, 10);
+        salesMap.set(key, { revenue: 0, cost: 0 });
+        cur.setDate(cur.getDate() + 1);
+      }
+      for (const order of paidOrders) {
+        const createdAt = new Date(order.createdAt);
+        const key = createdAt.toISOString().slice(0, 10);
+        if (salesMap.has(key)) {
+          const entry = salesMap.get(key);
+          entry.revenue += Number(order.total);
+          entry.cost += orderCost(order);
+        }
       }
     }
 
-    for (const [productId, totalQty] of productQtyMap.entries()) {
-      const productIngredients = await tx.productIngredient.findMany({
-        where: { productId },
-        include: { ingredient: true },
-      });
-
-      for (const pi of productIngredients) {
-        const required = pi.quantity * totalQty;
-
-        if (pi.ingredient.stockQuantity < required) {
-          throw new AppError(
-            `Estoque insuficiente de "${pi.ingredient.name}". Disponivel: ${pi.ingredient.stockQuantity} ${pi.ingredient.unit}, necessario: ${required} ${pi.ingredient.unit}.`,
-            409,
+    const topProductsMap = new Map();
+    for (const order of paidOrders) {
+      for (const item of order.items ?? []) {
+        if (item.productName) {
+          topProductsMap.set(
+            item.productName,
+            (topProductsMap.get(item.productName) ?? 0) + Number(item.quantity),
           );
         }
-
-        await tx.ingredient.update({
-          where: { id: pi.ingredientId },
-          data: { stockQuantity: { decrement: required } },
-        });
       }
     }
+
+    const topProducts = [...topProductsMap.entries()]
+      .map(([name, quantity]) => ({ name, quantity }))
+      .sort((a, b) => b.quantity - a.quantity)
+      .slice(0, 5);
+
+    return {
+      summary: {
+        totalRevenue: Number(totalRevenue.toFixed(2)),
+        totalCost: Number(totalCost.toFixed(2)),
+        totalProfit: Number((totalRevenue - totalCost).toFixed(2)),
+        revenueToday: Number(revenueToday.toFixed(2)),
+        costToday: Number(costToday.toFixed(2)),
+        profitToday: Number((revenueToday - costToday).toFixed(2)),
+        revenueThisMonth: Number(revenueThisMonth.toFixed(2)),
+        costThisMonth: Number(costThisMonth.toFixed(2)),
+        profitThisMonth: Number((revenueThisMonth - costThisMonth).toFixed(2)),
+        ordersCount: filteredOrders.length,
+        paidOrdersCount: paidOrders.length,
+        averageTicket: Number(averageTicket.toFixed(2)),
+      },
+      statusCounts,
+      dailySales: [...salesMap.entries()].map(([date, { revenue, cost }]) => ({
+        date,
+        revenue: Number(revenue.toFixed(2)),
+        cost: Number(cost.toFixed(2)),
+        profit: Number((revenue - cost).toFixed(2)),
+      })),
+      topProducts,
+    };
+  }
+
+  async getOrderById(orderId) {
+    const order = await this.orderRepository.findById(orderId);
+
+    if (!order) {
+      throw new AppError("Pedido nao encontrado.", 404);
+    }
+
+    return order;
+  }
+
+  async assignMotoboy(orderId, motoboyId) {
+    await this.orderRepository.assignMotoboy(orderId, motoboyId);
+  }
+
+  async confirmDelivery(orderId, code, user) {
+    try {
+      const order = await this.orderRepository.findById(orderId);
+      if (!order) throw new AppError("Pedido não encontrado.", 404);
+
+      if (order.paymentStatus !== "APROVADO") {
+        throw new AppError(
+          "Pedido precisa estar pago para confirmar a entrega.",
+          409,
+        );
+      }
+
+      if (
+        user?.role === "MOTOBOY" &&
+        order.assignedMotoboyId &&
+        order.assignedMotoboyId !== user.id
+      ) {
+        throw new AppError("Este pedido está atribuído a outro motoboy.", 403);
+      }
+
+      const updatedOrder = await this.orderRepository.confirmDelivery(
+        orderId,
+        code,
+      );
+      if (!updatedOrder) throw new AppError("Pedido não encontrado.", 404);
+      emitOrderStatusUpdated({
+        orderId: updatedOrder.id,
+        userId: updatedOrder.userId,
+        previousStatus: "SAIU_PARA_ENTREGA",
+        status: "ENTREGUE",
+      });
+      return updatedOrder;
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      if (err.message === "CODE_INVALID")
+        throw new AppError("Código inválido.", 400);
+      if (err.message === "STATUS_INVALID")
+        throw new AppError("Pedido não está em trânsito.", 400);
+      if (err.message === "IS_PICKUP")
+        throw new AppError("Pedido de retirada não usa código.", 400);
+      throw err;
+    }
+  }
+
+  async markPaidByMotoboy(orderId, user) {
+    const order = await this.orderRepository.findById(orderId);
+    if (!order) {
+      throw new AppError("Pedido não encontrado.", 404);
+    }
+
+    if (order.status !== "SAIU_PARA_ENTREGA") {
+      throw new AppError(
+        "Apenas pedidos em entrega podem ser marcados como pagos.",
+        409,
+      );
+    }
+
+    if (order.paymentStatus === "APROVADO") {
+      return order;
+    }
+
+    if (
+      user?.role === "MOTOBOY" &&
+      (!order.assignedMotoboyId || order.assignedMotoboyId !== user.id)
+    ) {
+      throw new AppError(
+        "Apenas o motoboy atribuído pode confirmar pagamento.",
+        403,
+      );
+    }
+
+    const updatedOrder = await this.orderRepository.updatePaymentStatus(
+      orderId,
+      "APROVADO",
+    );
+
+    emitPaymentUpdated({
+      orderId,
+      userId: order.userId,
+      paymentStatus: "APROVADO",
+    });
+
+    return updatedOrder;
+  }
+
+  async deleteOrder(orderId, userId) {
+    const row = await this.orderRepository.findOwnerAndStatus(orderId);
+    if (!row) throw new AppError("Pedido nao encontrado.", 404);
+    if (row.userId !== userId) throw new AppError("Acesso negado.", 403);
+    if (row.status !== "CANCELADO") {
+      throw new AppError(
+        "Somente pedidos cancelados podem ser excluidos.",
+        422,
+      );
+    }
+    await this.orderRepository.deleteById(orderId, userId);
+  }
+
+  async #normalizeItemInTransaction(tx, item) {
+    const quantity = item.quantity ?? 1;
+    if (!item.productId) {
+      throw new AppError("Item exige productId.", 422);
+    }
+
+    const product = await tx.product.findFirst({
+      where: {
+        id: item.productId,
+        isActive: true,
+      },
+      include: {
+        sizes: {
+          orderBy: {
+            price: "asc",
+          },
+          take: 1,
+        },
+      },
+    });
+
+    if (!product) {
+      throw new AppError("Produto invalido ou inativo.", 422);
+    }
+
+    const basePrice = product.sizes?.[0]?.price;
+    if (basePrice == null) {
+      throw new AppError("Produto sem preco configurado.", 422);
+    }
+
+    const addonIds = [...new Set(item.addonIds ?? [])];
+    let addons = [];
+    let addonsCents = 0;
+
+    if (addonIds.length > 0) {
+      const addonRows = await tx.addon.findMany({
+        where: {
+          id: {
+            in: addonIds,
+          },
+          isActive: true,
+        },
+      });
+
+      if (addonRows.length !== addonIds.length) {
+        throw new AppError("Um ou mais adicionais sao invalidos.", 422);
+      }
+
+      addons = addonRows.map((addon) => ({
+        id: addon.id,
+        name: addon.name,
+        price: Number(addon.price),
+      }));
+
+      addonsCents = addonRows.reduce(
+        (sum, addon) => sum + toCents(addon.price),
+        0,
+      );
+    }
+
+    const unitPriceCents = toCents(basePrice) + addonsCents;
+    const totalPriceCents = unitPriceCents * quantity;
+
+    return {
+      productId: item.productId,
+      quantity,
+      unitPriceCents,
+      totalPriceCents,
+      addons,
+      removedIngredients: item.removedIngredients ?? null,
+      notes: item.notes ?? null,
+    };
+  }
+
+  async #findOrderIdByTerminalReferences(paymentData) {
+    const rawCandidates = [
+      paymentData?.order?.id,
+      paymentData?.point_of_interaction?.transaction_data?.order_id,
+      paymentData?.point_of_interaction?.transaction_data
+        ?.external_resource_url,
+      paymentData?.metadata?.order_id,
+      paymentData?.metadata?.external_reference,
+      paymentData?.additional_info?.external_reference,
+    ].filter(Boolean);
+
+    const normalizedCandidates = [
+      ...new Set(
+        rawCandidates.flatMap((candidate) => {
+          const value = String(candidate).trim();
+          if (!value) return [];
+
+          const orderMatch = value.match(/\/v1\/orders\/([A-Z0-9]+)/i);
+          return [orderMatch?.[1] ?? value];
+        }),
+      ),
+    ];
+
+    for (const candidate of normalizedCandidates) {
+      if (!candidate || isMercadoPagoInternalReference(candidate)) continue;
+
+      const orderByIntent =
+        await this.orderRepository.findByTerminalIntentId?.(candidate);
+      if (orderByIntent?.id) {
+        console.log(
+          "[webhook] Pedido localizado por terminalIntentId:",
+          candidate,
+          "->",
+          orderByIntent.id,
+        );
+        return orderByIntent.id;
+      }
+    }
+
+    return null;
   }
 }

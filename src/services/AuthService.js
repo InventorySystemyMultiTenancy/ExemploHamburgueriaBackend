@@ -15,18 +15,18 @@ export class AuthService {
     authUser = null,
   ) {
     if (email) {
-      const existing = await this.userRepository.findByEmail(email);
-      if (existing) throw new AppError("Email ja cadastrado.", 409);
+      const existingByEmail = await this.userRepository.findByEmail(email);
+      if (existingByEmail) throw new AppError("Email ja cadastrado.", 409);
     }
 
     if (phone) {
-      const existing = await this.userRepository.findByPhone(phone);
-      if (existing) throw new AppError("Telefone ja cadastrado.", 409);
+      const existingByPhone = await this.userRepository.findByPhone(phone);
+      if (existingByPhone) throw new AppError("Telefone ja cadastrado.", 409);
     }
 
     if (cpf) {
-      const existing = await this.userRepository.findByCpf(cpf);
-      if (existing) throw new AppError("CPF ja cadastrado.", 409);
+      const existingByCpf = await this.userRepository.findByCpf(cpf);
+      if (existingByCpf) throw new AppError("CPF ja cadastrado.", 409);
     }
 
     const requestedRole = role || "CLIENTE";
@@ -55,47 +55,51 @@ export class AuthService {
     });
 
     if (requestedRole === "CLIENTE") {
-      const token = this.#generateToken(user);
+      const token = jwt.sign(
+        { role: user.role, email: user.email || null },
+        process.env.JWT_SECRET,
+        { subject: user.id, expiresIn: process.env.JWT_EXPIRES_IN || "8h" },
+      );
       return {
         accessToken: token,
-        user: this.#safeUser(user),
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          phone: user.phone,
+          address: user.address,
+          role: user.role,
+        },
       };
     }
 
-    return { user: this.#safeUser(user) };
+    return { user };
   }
 
   async login({ identifier, password }) {
     const user = await this.userRepository.findByEmailOrPhone(identifier);
+
     if (!user) throw new AppError("Credenciais invalidas.", 401);
 
-    const isValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isValid) throw new AppError("Credenciais invalidas.", 401);
+    const isValidPassword = await bcrypt.compare(password, user.passwordHash);
+    if (!isValidPassword) throw new AppError("Credenciais invalidas.", 401);
 
-    const token = this.#generateToken(user);
-
-    return {
-      accessToken: token,
-      user: this.#safeUser(user),
-    };
-  }
-
-  #generateToken(user) {
-    return jwt.sign(
+    const token = jwt.sign(
       { role: user.role, email: user.email || null },
       process.env.JWT_SECRET,
       { subject: user.id, expiresIn: process.env.JWT_EXPIRES_IN || "8h" },
     );
-  }
 
-  #safeUser(user) {
     return {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      address: user.address,
-      role: user.role,
+      accessToken: token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        address: user.address,
+        role: user.role,
+      },
     };
   }
 }

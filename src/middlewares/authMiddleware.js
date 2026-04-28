@@ -1,8 +1,9 @@
 import jwt from "jsonwebtoken";
 import { AppError } from "../errors/AppError.js";
-import { prisma } from "../lib/prisma.js";
+import { OrderRepository } from "../repositories/OrderRepository.js";
 
-// ─── Autenticação JWT ─────────────────────────────────────────────────────────
+const orderRepository = new OrderRepository();
+
 export const authenticateToken = (req, _res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -22,12 +23,14 @@ export const authenticateToken = (req, _res, next) => {
 
     return next();
   } catch (error) {
-    if (error instanceof AppError) return next(error);
+    if (error instanceof AppError) {
+      return next(error);
+    }
+
     return next(new AppError("Token invalido ou expirado.", 401));
   }
 };
 
-// ─── RBAC: Role-Based Access Control ─────────────────────────────────────────
 export const authorizeRoles =
   (...allowedRoles) =>
   (req, _res, next) => {
@@ -42,9 +45,6 @@ export const authorizeRoles =
     return next();
   };
 
-// ─── IDOR: proteção de acesso a pedidos alheios ───────────────────────────────
-// Garante que o CLIENTE só acessa seus próprios pedidos.
-// Staff (ADMIN, COZINHA, FUNCIONARIO, MOTOBOY) passa sem restrição.
 export const enforceOrderOwnership = async (req, _res, next) => {
   try {
     const orderId = req.params.orderId || req.params.id;
@@ -53,33 +53,23 @@ export const enforceOrderOwnership = async (req, _res, next) => {
       throw new AppError("orderId nao informado.", 400);
     }
 
-    const STAFF_BYPASS = new Set([
-      "ADMIN",
-      "COZINHA",
-      "FUNCIONARIO",
-      "MOTOBOY",
-    ]);
-
-    if (STAFF_BYPASS.has(req.user.role)) {
+    if (
+      req.user.role === "ADMIN" ||
+      req.user.role === "COZINHA" ||
+      req.user.role === "FUNCIONARIO" ||
+      req.user.role === "MOTOBOY"
+    ) {
       return next();
     }
 
-    // Busca o pedido verificando dono sem expor dados desnecessários
-    const rows = await prisma.$queryRaw`
-      SELECT o.id, o."userId", u.id AS "uId", u.role::text AS "uRole"
-      FROM "Order" o
-      LEFT JOIN "User" u ON u.id = o."userId"
-      WHERE o.id = ${orderId}
-    `;
+    const order = await orderRepository.findByIdWithUser(orderId);
 
-    if (!rows.length) {
+    if (!order) {
       throw new AppError("Pedido nao encontrado.", 404);
     }
 
-    const order = rows[0];
-
-    if (req.user.role === "CLIENTE") {
-      if (!order.uId || order.uId !== req.user.id) {
+    if (req.user.role === "MESA") {
+      if (order.mesaId !== req.user.id) {
         throw new AppError(
           "Voce nao tem permissao para acessar este pedido.",
           403,
@@ -88,7 +78,18 @@ export const enforceOrderOwnership = async (req, _res, next) => {
       return next();
     }
 
-    throw new AppError("Perfil sem permissao para acessar pedido.", 403);
+    if (req.user.role !== "CLIENTE") {
+      throw new AppError("Perfil sem permissao para acessar pedido.", 403);
+    }
+
+    if (!order.user || order.user.id !== req.user.id) {
+      throw new AppError(
+        "Voce nao tem permissao para acessar este pedido.",
+        403,
+      );
+    }
+
+    return next();
   } catch (error) {
     return next(error);
   }

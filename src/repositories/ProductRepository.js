@@ -1,73 +1,97 @@
 import { prisma } from "../lib/prisma.js";
 
-export class ProductRepository {
-  // ── Produtos ─────────────────────────────────────────────────────────────
+// Busca categorias via raw SQL (compatível com qualquer versão do Prisma Client)
+async function fetchCategories(ids) {
+  if (!ids.length) return new Map();
+  const rows =
+    await prisma.$queryRaw`SELECT "id", "category" FROM "Product" WHERE "id" = ANY(${ids})`;
+  return new Map(rows.map((r) => [r.id, r.category ?? "Geral"]));
+}
 
+export class ProductRepository {
   async findAll() {
-    return prisma.product.findMany({
-      where: { isActive: true, isAvailable: true },
-      include: {
-        productAddons: {
-          include: { addon: true },
-          where: { addon: { isActive: true } },
-        },
-      },
-      orderBy: [{ category: "asc" }, { name: "asc" }],
+    const products = await prisma.product.findMany({
+      where: { isActive: true },
+      include: { sizes: { orderBy: { size: "asc" } } },
+      orderBy: [{ isCrust: "asc" }, { name: "asc" }],
     });
+    const catMap = await fetchCategories(products.map((p) => p.id));
+    return products.map((p) => ({
+      ...p,
+      category: catMap.get(p.id) ?? "Geral",
+    }));
   }
 
   async findAllForAdmin() {
-    return prisma.product.findMany({
-      include: {
-        productAddons: { include: { addon: true } },
-        productIngredients: { include: { ingredient: true } },
-      },
-      orderBy: [{ category: "asc" }, { name: "asc" }],
+    const products = await prisma.product.findMany({
+      include: { sizes: { orderBy: { size: "asc" } } },
+      orderBy: [{ isCrust: "asc" }, { name: "asc" }],
     });
+    const catMap = await fetchCategories(products.map((p) => p.id));
+    return products.map((p) => ({
+      ...p,
+      category: catMap.get(p.id) ?? "Geral",
+    }));
   }
 
-  async findById(productId) {
-    return prisma.product.findUnique({
-      where: { id: productId },
-      include: {
-        productAddons: {
-          include: { addon: true },
-          where: { addon: { isActive: true } },
-        },
-        productIngredients: { include: { ingredient: true } },
-      },
-    });
-  }
-
-  async create({ name, description, imageUrl, category, basePrice, isBurger }) {
-    return prisma.product.create({
+  async create({ name, description, imageUrl, category, isCrust, sizes }) {
+    // category é gravado via raw SQL para ser compatível com qualquer versão do Prisma Client
+    const product = await prisma.product.create({
       data: {
         name,
         description: description ?? null,
         imageUrl: imageUrl ?? null,
-        category: category ?? "Hambúrgueres",
-        basePrice,
-        isBurger: isBurger ?? false,
+        isCrust: isCrust ?? false,
+        sizes: {
+          create: sizes.map(({ size, price, costPrice }) => ({
+            size,
+            price,
+            ...(costPrice != null ? { costPrice } : {}),
+          })),
+        },
       },
+      include: { sizes: { orderBy: { size: "asc" } } },
     });
+    const cat = category ?? "Geral";
+    await prisma.$executeRaw`UPDATE "Product" SET "category" = ${cat} WHERE "id" = ${product.id}`;
+    return { ...product, category: cat };
   }
 
   async update(
     productId,
-    { name, description, imageUrl, category, basePrice, isBurger, isAvailable },
+    { name, description, imageUrl, category, isCrust, sizes },
   ) {
-    return prisma.product.update({
-      where: { id: productId },
-      data: {
-        ...(name !== undefined && { name }),
-        ...(description !== undefined && { description }),
-        ...(imageUrl !== undefined && { imageUrl }),
-        ...(category !== undefined && { category }),
-        ...(basePrice !== undefined && { basePrice }),
-        ...(isBurger !== undefined && { isBurger }),
-        ...(isAvailable !== undefined && { isAvailable }),
-      },
-      include: { productAddons: { include: { addon: true } } },
+    return prisma.$transaction(async (tx) => {
+      await tx.product.update({
+        where: { id: productId },
+        data: {
+          ...(name !== undefined && { name }),
+          ...(description !== undefined && { description }),
+          ...(imageUrl !== undefined && { imageUrl }),
+          ...(isCrust !== undefined && { isCrust }),
+        },
+      });
+
+      if (category !== undefined) {
+        await tx.$executeRaw`UPDATE "Product" SET "category" = ${category} WHERE "id" = ${productId}`;
+      }
+
+      if (sizes) {
+        await tx.productSize.deleteMany({ where: { productId } });
+        await tx.productSize.createMany({
+          data: sizes.map(({ size, price, costPrice }) => ({
+            productId,
+            size,
+            price,
+            ...(costPrice != null ? { costPrice } : {}),
+          })),
+        });
+      }
+
+      return tx.product.findUnique({
+        where: { id: productId },
+        include: { sizes: { orderBy: { size: "asc" } } },
+      });
     });
   }
 
@@ -78,142 +102,108 @@ export class ProductRepository {
     });
   }
 
-  // Vincula/desvincula adicionais de um produto
-  async syncAddons(productId, addonIds) {
-    await prisma.productAddon.deleteMany({ where: { productId } });
-    if (addonIds.length) {
-      await prisma.productAddon.createMany({
-        data: addonIds.map((addonId) => ({ productId, addonId })),
-        skipDuplicates: true,
-      });
-    }
+  async findByIdWithSizes(productId) {
+    return prisma.product.findUnique({
+      where: { id: productId },
+      include: { sizes: true },
+    });
   }
 
-  // Top N produtos mais vendidos (por quantidade de itens em pedidos ENTREGUE/APROVADO)
   async findTopSelling(limit = 6) {
     const rows = await prisma.$queryRawUnsafe(
-      `SELECT p.id, p.name, p.category, p."basePrice", p."imageUrl",
-              COALESCE(SUM(oi.quantity), 0)::int AS "salesCount"
-       FROM "Product" p
-       LEFT JOIN "OrderItem" oi ON oi."productId" = p.id
-       LEFT JOIN "Order" o ON o.id = oi."orderId"
-         AND o.status = 'ENTREGUE'
+      `SELECT ranked."productId", SUM(ranked.quantity)::int AS "soldCount"
+       FROM (
+         SELECT oi."productId", oi.quantity
+         FROM "OrderItem" oi
+         INNER JOIN "Order" o ON o.id = oi."orderId"
+         WHERE oi."productId" IS NOT NULL
+           AND o."paymentStatus"::text = 'APROVADO'
+
+         UNION ALL
+
+         SELECT oi."firstHalfProductId" AS "productId", oi.quantity
+         FROM "OrderItem" oi
+         INNER JOIN "Order" o ON o.id = oi."orderId"
+         WHERE oi."firstHalfProductId" IS NOT NULL
+           AND o."paymentStatus"::text = 'APROVADO'
+
+         UNION ALL
+
+         SELECT oi."secondHalfProductId" AS "productId", oi.quantity
+         FROM "OrderItem" oi
+         INNER JOIN "Order" o ON o.id = oi."orderId"
+         WHERE oi."secondHalfProductId" IS NOT NULL
+           AND o."paymentStatus"::text = 'APROVADO'
+       ) ranked
+       INNER JOIN "Product" p ON p.id = ranked."productId"
        WHERE p."isActive" = true
-       GROUP BY p.id, p.name, p.category, p."basePrice", p."imageUrl"
-       ORDER BY "salesCount" DESC, p.name ASC
+         AND p."isCrust" = false
+       GROUP BY ranked."productId"
+       ORDER BY "soldCount" DESC, ranked."productId" ASC
        LIMIT $1`,
       limit,
     );
-    return rows;
-  }
 
-  // ── Adicionais ────────────────────────────────────────────────────────────
+    if (!rows.length) {
+      return [];
+    }
 
-  async findAllAddons() {
-    return prisma.addon.findMany({
-      orderBy: [{ category: "asc" }, { name: "asc" }],
-    });
-  }
-
-  async findAddonById(addonId) {
-    return prisma.addon.findUnique({ where: { id: addonId } });
-  }
-
-  async createAddon({ name, description, price, category }) {
-    return prisma.addon.create({
-      data: {
-        name,
-        description: description ?? null,
-        price,
-        category: category ?? "Extra",
+    const ids = rows.map((row) => row.productId);
+    const soldCountById = new Map(rows.map((row) => [row.productId, row.soldCount]));
+    const products = await prisma.product.findMany({
+      where: {
+        id: { in: ids },
+        isActive: true,
+        isCrust: false,
+      },
+      include: {
+        sizes: { orderBy: { size: "asc" } },
       },
     });
+
+    const categoryMap = await fetchCategories(products.map((product) => product.id));
+    const productsById = new Map(products.map((product) => [product.id, product]));
+
+    return ids
+      .map((id) => productsById.get(id))
+      .filter(Boolean)
+      .map((product) => ({
+        ...product,
+        category: categoryMap.get(product.id) ?? "Geral",
+        soldCount: soldCountById.get(product.id) ?? 0,
+      }));
   }
 
-  async updateAddon(addonId, data) {
-    return prisma.addon.update({ where: { id: addonId }, data });
-  }
-
-  async setAddonActive(addonId, isActive) {
-    return prisma.addon.update({ where: { id: addonId }, data: { isActive } });
-  }
-
-  // ── Combos ────────────────────────────────────────────────────────────────
-
-  async findAllCombos() {
-    return prisma.combo.findMany({
-      where: { isActive: true },
-      include: { parts: { include: { product: true } } },
-      orderBy: { name: "asc" },
-    });
-  }
-
-  async findAllCombosForAdmin() {
-    return prisma.combo.findMany({
-      include: { parts: { include: { product: true } } },
-      orderBy: { name: "asc" },
-    });
-  }
-
-  async findComboById(comboId) {
-    return prisma.combo.findUnique({
-      where: { id: comboId },
-      include: { parts: { include: { product: true } } },
-    });
-  }
-
-  async createCombo({ name, description, imageUrl, promotionalPrice, parts }) {
-    return prisma.combo.create({
-      data: {
-        name,
-        description: description ?? null,
-        imageUrl: imageUrl ?? null,
-        promotionalPrice,
-        parts: {
-          create: parts.map(({ productId, quantity }) => ({
-            productId,
-            quantity: quantity ?? 1,
-          })),
+  async findSizePrice(productId, size, { isCrust } = {}) {
+    const sizeEntry = await prisma.productSize.findUnique({
+      where: {
+        productId_size: {
+          productId,
+          size,
         },
       },
-      include: { parts: { include: { product: true } } },
-    });
-  }
-
-  async updateCombo(
-    comboId,
-    { name, description, imageUrl, promotionalPrice, parts },
-  ) {
-    return prisma.$transaction(async (tx) => {
-      await tx.combo.update({
-        where: { id: comboId },
-        data: {
-          ...(name !== undefined && { name }),
-          ...(description !== undefined && { description }),
-          ...(imageUrl !== undefined && { imageUrl }),
-          ...(promotionalPrice !== undefined && { promotionalPrice }),
+      include: {
+        product: {
+          select: {
+            id: true,
+            isActive: true,
+            isCrust: true,
+          },
         },
-      });
-
-      if (parts) {
-        await tx.comboPart.deleteMany({ where: { comboId } });
-        await tx.comboPart.createMany({
-          data: parts.map(({ productId, quantity }) => ({
-            comboId,
-            productId,
-            quantity: quantity ?? 1,
-          })),
-        });
-      }
-
-      return tx.combo.findUnique({
-        where: { id: comboId },
-        include: { parts: { include: { product: true } } },
-      });
+      },
     });
-  }
 
-  async setComboActive(comboId, isActive) {
-    return prisma.combo.update({ where: { id: comboId }, data: { isActive } });
+    if (!sizeEntry?.product?.isActive) {
+      return null;
+    }
+
+    if (
+      typeof isCrust === "boolean" &&
+      sizeEntry.product.isCrust !== isCrust
+    ) {
+      return null;
+    }
+
+    return sizeEntry;
   }
 }
