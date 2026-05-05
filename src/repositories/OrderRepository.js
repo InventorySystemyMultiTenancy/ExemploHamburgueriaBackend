@@ -6,19 +6,19 @@ export class OrderRepository {
   async _fetchItemsForOrders(orderIds) {
     if (!orderIds.length) return [];
     const ph = orderIds.map((_, i) => `$${i + 1}`).join(", ");
-    return prisma.$queryRawUnsafe(
-      `SELECT oi.*, p.name AS "productName",
-              fp.name AS "firstHalfProductName",
-              sp.name AS "secondHalfProductName",
-              cp.name AS "crustProductName"
+    const rows = await prisma.$queryRawUnsafe(
+      `SELECT oi.*, p.name AS "productName"
        FROM "OrderItem" oi
        LEFT JOIN "Product" p ON p.id = oi."productId"
-       LEFT JOIN "Product" fp ON fp.id = oi."firstHalfProductId"
-       LEFT JOIN "Product" sp ON sp.id = oi."secondHalfProductId"
-       LEFT JOIN "Product" cp ON cp.id = oi."crustProductId"
        WHERE oi."orderId" IN (${ph})`,
       ...orderIds,
     );
+    return rows.map((row) => ({
+      ...row,
+      product: row.productName
+        ? { id: row.productId, name: row.productName }
+        : null,
+    }));
   }
 
   async _fetchPaymentsForOrders(orderIds) {
@@ -75,15 +75,9 @@ export class OrderRepository {
     const order = rows[0];
 
     const items = await prisma.$queryRaw`
-      SELECT oi.*, p.name AS "productName",
-             fp.name AS "firstHalfProductName",
-             sp.name AS "secondHalfProductName",
-             cp.name AS "crustProductName"
+      SELECT oi.*, p.name AS "productName"
       FROM "OrderItem" oi
       LEFT JOIN "Product" p ON p.id = oi."productId"
-      LEFT JOIN "Product" fp ON fp.id = oi."firstHalfProductId"
-      LEFT JOIN "Product" sp ON sp.id = oi."secondHalfProductId"
-      LEFT JOIN "Product" cp ON cp.id = oi."crustProductId"
       WHERE oi."orderId" = ${orderId}
     `;
     const payments = await prisma.$queryRaw`
@@ -343,9 +337,6 @@ export class OrderRepository {
         items: {
           include: {
             product: { select: { id: true, name: true } },
-            firstHalfProduct: { select: { id: true, name: true } },
-            secondHalfProduct: { select: { id: true, name: true } },
-            crustProduct: { select: { id: true, name: true } },
           },
         },
         user: { select: { id: true, name: true } },
@@ -432,27 +423,14 @@ export class OrderRepository {
     // Busca itens com costPrice do tamanho correspondente
     const ph = orderIds.map((_, i) => `$${i + 1}`).join(", ");
     const items = await prisma.$queryRawUnsafe(
-      `SELECT oi."orderId", oi.quantity, oi.type, oi.size,
+      `SELECT oi."orderId", oi.quantity,
               oi."unitPrice", oi."totalPrice",
-              oi."productId", oi."firstHalfProductId", oi."secondHalfProductId", oi."crustProductId",
+              oi."productId",
               p.name AS "productName",
-              fp.name AS "firstHalfProductName",
-              sp.name AS "secondHalfProductName",
-              cp.name AS "crustProductName",
-              COALESCE(ps."costPrice", 0) + COALESCE(cps."costPrice", 0) AS "costPrice"
+              COALESCE(ps."costPrice", 0) AS "costPrice"
        FROM "OrderItem" oi
        LEFT JOIN "Product" p ON p.id = oi."productId"
-       LEFT JOIN "Product" fp ON fp.id = oi."firstHalfProductId"
-       LEFT JOIN "Product" sp ON sp.id = oi."secondHalfProductId"
-       LEFT JOIN "Product" cp ON cp.id = oi."crustProductId"
-       LEFT JOIN "ProductSize" ps ON (
-         ps."productId" = COALESCE(oi."productId", oi."firstHalfProductId")
-         AND ps.size = oi.size::\"ProductSizeEnum\"
-       )
-       LEFT JOIN "ProductSize" cps ON (
-         cps."productId" = oi."crustProductId"
-         AND cps.size = oi.size::\"ProductSizeEnum\"
-       )
+       LEFT JOIN "ProductSize" ps ON ps."productId" = oi."productId"
        WHERE oi."orderId" IN (${ph})`,
       ...orderIds,
     );
