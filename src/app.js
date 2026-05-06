@@ -37,6 +37,7 @@ if (!process.env.MP_WEBHOOK_SECRET) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
+app.set("trust proxy", 1);
 const authController = new AuthController();
 const orderController = new OrderController();
 const paymentController = new PaymentController();

@@ -6,6 +6,35 @@ export class OrderRepository {
     return error?.code === "42703" || message.includes("does not exist");
   }
 
+  _logDbError(context, error) {
+    console.error(`[${context}] erro SQL`, {
+      prismaCode: error?.code ?? null,
+      dbCode: error?.meta?.code ?? null,
+      dbMessage: error?.meta?.message ?? null,
+      message: error?.message ?? null,
+    });
+  }
+
+  async _logTableColumns(context, tableName) {
+    try {
+      const rows = await prisma.$queryRaw`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = ${tableName}
+        ORDER BY ordinal_position
+      `;
+
+      const columns = rows.map((r) => r.column_name);
+      console.log(`[${context}] schema ${tableName} columns=`, columns);
+    } catch (schemaError) {
+      console.warn(
+        `[${context}] falha ao ler information_schema para ${tableName}:`,
+        schemaError?.message,
+      );
+    }
+  }
+
   _pick(obj, keys, fallback = null) {
     for (const key of keys) {
       if (obj[key] !== undefined && obj[key] !== null) {
@@ -19,6 +48,7 @@ export class OrderRepository {
     return {
       id: this._pick(raw, ["id"]),
       userId: this._pick(raw, ["userId", "user_id", "userid"]),
+      mesaId: this._pick(raw, ["mesaId", "mesa_id", "mesaid"]),
       status: this._pick(raw, ["status"], "RECEBIDO"),
       paymentStatus: this._pick(
         raw,
@@ -223,14 +253,60 @@ export class OrderRepository {
   async _fetchUsersForOrders(orderIds) {
     if (!orderIds.length) return [];
     const ph = orderIds.map((_, i) => `$${i + 1}`).join(", ");
-    return prisma.$queryRawUnsafe(
-      `SELECT u.id, u.name FROM "User" u
-       WHERE u.id IN (
-         SELECT DISTINCT "userId" FROM "Order"
-         WHERE id IN (${ph}) AND "userId" IS NOT NULL
-       )`,
-      ...orderIds,
-    );
+    try {
+      return await prisma.$queryRawUnsafe(
+        `SELECT u.id, u.name FROM "User" u
+         WHERE u.id IN (
+           SELECT DISTINCT "userId" FROM "Order"
+           WHERE id IN (${ph}) AND "userId" IS NOT NULL
+         )`,
+        ...orderIds,
+      );
+    } catch (error) {
+      if (!this._isMissingColumnError(error)) {
+        this._logDbError("_fetchUsersForOrders/main", error);
+        throw error;
+      }
+
+      this._logDbError("_fetchUsersForOrders/main", error);
+      await this._logTableColumns("_fetchUsersForOrders/main", "Order");
+      await this._logTableColumns("_fetchUsersForOrders/main", "User");
+
+      console.warn(
+        "[_fetchUsersForOrders] fallback legado (snake_case):",
+        error.message,
+      );
+
+      try {
+        return await prisma.$queryRawUnsafe(
+          `SELECT u.id, u.name FROM "User" u
+           WHERE u.id IN (
+             SELECT DISTINCT "user_id" FROM "Order"
+             WHERE id IN (${ph}) AND "user_id" IS NOT NULL
+           )`,
+          ...orderIds,
+        );
+      } catch (legacyError) {
+        if (!this._isMissingColumnError(legacyError)) {
+          this._logDbError("_fetchUsersForOrders/snake_case", legacyError);
+          throw legacyError;
+        }
+
+        this._logDbError("_fetchUsersForOrders/snake_case", legacyError);
+        await this._logTableColumns("_fetchUsersForOrders/snake_case", "Order");
+
+        console.warn(
+          "[_fetchUsersForOrders] fallback JSON legado:",
+          legacyError.message,
+        );
+
+        const rows = await prisma.$queryRaw`
+          SELECT id, name
+          FROM "User"
+        `;
+        return rows;
+      }
+    }
   }
 
   async createOrder(data) {
@@ -499,14 +575,39 @@ export class OrderRepository {
   async _fetchMesasForOrders(orderIds) {
     if (!orderIds.length) return [];
     const ph = orderIds.map((_, i) => `$${i + 1}`).join(", ");
-    return prisma.$queryRawUnsafe(
-      `SELECT m.id, m.name, m.number FROM "Mesa" m
-       WHERE m.id IN (
-         SELECT DISTINCT "mesaId" FROM "Order"
-         WHERE id IN (${ph}) AND "mesaId" IS NOT NULL
-       )`,
-      ...orderIds,
-    );
+    try {
+      return await prisma.$queryRawUnsafe(
+        `SELECT m.id, m.name, m.number FROM "Mesa" m
+         WHERE m.id IN (
+           SELECT DISTINCT "mesaId" FROM "Order"
+           WHERE id IN (${ph}) AND "mesaId" IS NOT NULL
+         )`,
+        ...orderIds,
+      );
+    } catch (error) {
+      if (!this._isMissingColumnError(error)) {
+        this._logDbError("_fetchMesasForOrders/main", error);
+        throw error;
+      }
+
+      this._logDbError("_fetchMesasForOrders/main", error);
+      await this._logTableColumns("_fetchMesasForOrders/main", "Order");
+      await this._logTableColumns("_fetchMesasForOrders/main", "Mesa");
+
+      console.warn(
+        "[_fetchMesasForOrders] fallback legado (snake_case):",
+        error.message,
+      );
+
+      return prisma.$queryRawUnsafe(
+        `SELECT m.id, m.name, m.number FROM "Mesa" m
+         WHERE m.id IN (
+           SELECT DISTINCT "mesa_id" FROM "Order"
+           WHERE id IN (${ph}) AND "mesa_id" IS NOT NULL
+         )`,
+        ...orderIds,
+      );
+    }
   }
 
   async findAllActive() {
@@ -527,14 +628,101 @@ export class OrderRepository {
       `;
       console.log("[findAllActive] orders count=", orders.length);
     } catch (e) {
-      console.error("[findAllActive] FALHOU na query de orders:", e);
-      throw e;
+      if (this._isMissingColumnError(e)) {
+        this._logDbError("findAllActive/main", e);
+        await this._logTableColumns("findAllActive/main", "Order");
+
+        console.warn(
+          "[findAllActive] fallback ativado por coluna ausente no banco:",
+          e.message,
+        );
+
+        try {
+          orders = await prisma.$queryRaw`
+            SELECT
+              o.id,
+              o."user_id" AS "userId",
+              o."mesa_id" AS "mesaId",
+              o.status::text AS status,
+              o."payment_status"::text AS "paymentStatus",
+              o."delivery_address" AS "deliveryAddress",
+              o.notes,
+              o."payment_method" AS "paymentMethod",
+              o.total,
+              o."delivery_fee" AS "deliveryFee",
+              o."delivery_lat" AS "deliveryLat",
+              o."delivery_lon" AS "deliveryLon",
+              o."is_pickup" AS "isPickup",
+              o."assigned_motoboy_id" AS "assignedMotoboyId",
+              o."created_at" AS "createdAt",
+              o."updated_at" AS "updatedAt",
+              o."delivered_at" AS "deliveredAt"
+            FROM "Order" o
+            WHERE o.status::text NOT IN ('ENTREGUE','CANCELADO')
+            ORDER BY o."created_at" ASC
+          `;
+        } catch (snakeCaseError) {
+          if (!this._isMissingColumnError(snakeCaseError)) {
+            this._logDbError("findAllActive/snake_case", snakeCaseError);
+            throw snakeCaseError;
+          }
+
+          this._logDbError("findAllActive/snake_case", snakeCaseError);
+          await this._logTableColumns("findAllActive/snake_case", "Order");
+
+          console.warn(
+            "[findAllActive] fallback JSON legado:",
+            snakeCaseError.message,
+          );
+
+          const jsonRows = await prisma.$queryRaw`
+            SELECT to_jsonb(o) AS row
+            FROM "Order" o
+          `;
+
+          orders = jsonRows
+            .map((r) => this._normalizeLegacyOrder(r.row ?? {}))
+            .filter(
+              (o) =>
+                !["ENTREGUE", "CANCELADO"].includes(
+                  String(o.status ?? "").toUpperCase(),
+                ),
+            )
+            .sort((a, b) => {
+              const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+              const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+              return da - db;
+            });
+        }
+
+        orders = orders.map((order) => ({
+          ...order,
+          deliveryFee: order.deliveryFee ?? null,
+          deliveryLat: order.deliveryLat ?? null,
+          deliveryLon: order.deliveryLon ?? null,
+          isPickup: order.isPickup ?? false,
+          assignedMotoboyId: order.assignedMotoboyId ?? null,
+          deliveredAt: order.deliveredAt ?? null,
+        }));
+
+        console.log("[findAllActive] fallback orders count=", orders.length);
+        console.log("[findAllActive] fallback sample order keys=", {
+          keys: orders[0] ? Object.keys(orders[0]) : [],
+        });
+      } else {
+        this._logDbError("findAllActive/main", e);
+        console.error("[findAllActive] FALHOU na query de orders:", e);
+        throw e;
+      }
     }
 
     if (!orders.length) return [];
 
     const orderIds = orders.map((o) => o.id);
     console.log("[findAllActive] orderIds=", orderIds);
+    console.log("[findAllActive] sample order keys=", {
+      keys: orders[0] ? Object.keys(orders[0]) : [],
+    });
 
     let items, users, mesas;
     try {

@@ -716,8 +716,36 @@ export class OrderService {
   }
 
   async listActiveOrders() {
-    const orders = await this.orderRepository.findAllActive();
-    return orders.filter((o) => o.status !== "CANCELADO");
+    console.log("[listActiveOrders] start");
+    try {
+      const orders = await this.orderRepository.findAllActive();
+      console.log("[listActiveOrders] repository orders count=", orders.length);
+
+      const filtered = orders.filter((o) => o.status !== "CANCELADO");
+      console.log("[listActiveOrders] filtered orders count=", filtered.length);
+
+      if (filtered[0]) {
+        console.log("[listActiveOrders] first order snapshot=", {
+          id: filtered[0].id,
+          status: filtered[0].status,
+          paymentStatus: filtered[0].paymentStatus,
+          hasUser: Boolean(filtered[0].user),
+          hasMesa: Boolean(filtered[0].mesa),
+          itemsCount: Array.isArray(filtered[0].items)
+            ? filtered[0].items.length
+            : 0,
+        });
+      }
+
+      return filtered;
+    } catch (error) {
+      console.error("[listActiveOrders] falhou", {
+        message: error?.message ?? null,
+        code: error?.code ?? null,
+        meta: error?.meta ?? null,
+      });
+      throw error;
+    }
   }
 
   async listOrderHistory({ clientName, dateFrom, dateTo } = {}) {
