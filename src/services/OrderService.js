@@ -115,69 +115,137 @@ export class OrderService {
         }
       }
 
-      return tx.order.create({
-        data: {
-          ...(userId ? { userId } : {}),
-          ...(mesaId ? { mesaId } : {}),
-          deliveryAddress: deliveryAddress ?? null,
-          notes,
-          total: new Prisma.Decimal(fromCents(totalCents)),
-          paymentStatus: "PENDENTE",
-          ...(isPickup != null ? { isPickup } : {}),
-          ...(isPickup
-            ? {}
-            : {
-                deliveryCode: String(Math.floor(1000 + Math.random() * 9000)),
-              }),
-          ...(paymentMethod != null ? { paymentMethod } : {}),
-          ...(deliveryFee != null
-            ? { deliveryFee: new Prisma.Decimal(deliveryFee) }
-            : {}),
-          ...(deliveryLat != null ? { deliveryLat } : {}),
-          ...(deliveryLon != null ? { deliveryLon } : {}),
-          items: {
-            create: normalizedItems.map((item) => ({
-              quantity: item.quantity,
-              unitPrice: new Prisma.Decimal(fromCents(item.unitPriceCents)),
-              totalPrice: new Prisma.Decimal(fromCents(item.totalPriceCents)),
-              productId: item.productId,
-              addons: item.addons,
-              removedIngredients: item.removedIngredients,
-              notes: item.notes ?? null,
-            })),
-          },
-          payment: {
-            create: {
-              provider: "MERCADO_PAGO",
-              amount: new Prisma.Decimal(fromCents(totalCents)),
-              status: "PENDENTE",
-              payload: {
-                paymentMethod: paymentMethod || "nao_informado",
+      const paymentPayload = {
+        provider: "MERCADO_PAGO",
+        amount: new Prisma.Decimal(fromCents(totalCents)),
+        status: "PENDENTE",
+        payload: {
+          paymentMethod: paymentMethod || "nao_informado",
+        },
+      };
+
+      const orderCreateData = {
+        ...(userId ? { userId } : {}),
+        ...(mesaId ? { mesaId } : {}),
+        deliveryAddress: deliveryAddress ?? null,
+        notes,
+        total: new Prisma.Decimal(fromCents(totalCents)),
+        paymentStatus: "PENDENTE",
+        ...(isPickup != null ? { isPickup } : {}),
+        ...(isPickup
+          ? {}
+          : {
+              deliveryCode: String(Math.floor(1000 + Math.random() * 9000)),
+            }),
+        ...(paymentMethod != null ? { paymentMethod } : {}),
+        ...(deliveryFee != null
+          ? { deliveryFee: new Prisma.Decimal(deliveryFee) }
+          : {}),
+        ...(deliveryLat != null ? { deliveryLat } : {}),
+        ...(deliveryLon != null ? { deliveryLon } : {}),
+        items: {
+          create: normalizedItems.map((item) => ({
+            quantity: item.quantity,
+            unitPrice: new Prisma.Decimal(fromCents(item.unitPriceCents)),
+            totalPrice: new Prisma.Decimal(fromCents(item.totalPriceCents)),
+            productId: item.productId,
+            addons: item.addons,
+            removedIngredients: item.removedIngredients,
+            notes: item.notes ?? null,
+          })),
+        },
+        payment: {
+          create: paymentPayload,
+        },
+      };
+
+      try {
+        return await tx.order.create({
+          data: orderCreateData,
+          include: {
+            items: true,
+            payment: true,
+            user: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
               },
             },
           },
-        },
-        include: {
-          items: true,
-          payment: true,
-          user: {
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              role: true,
+        });
+      } catch (error) {
+        if (!this.#isMissingColumnError(error)) {
+          throw error;
+        }
+
+        console.warn(
+          "[OrderService.createOrder] Fallback por coluna ausente no banco:",
+          error.message,
+        );
+
+        const orderColumns = await this.#getTableColumns(tx, "Order");
+        const compatibleOrderData = this.#buildOrderDataForColumns(
+          orderCreateData,
+          orderColumns,
+        );
+
+        try {
+          return await tx.order.create({
+            data: compatibleOrderData,
+            include: {
+              items: true,
+              payment: true,
             },
-          },
-        },
-      });
+          });
+        } catch (compatError) {
+          if (!this.#isMissingColumnError(compatError)) {
+            throw compatError;
+          }
+
+          console.warn(
+            "[OrderService.createOrder] Fallback sem nested payment por coluna ausente:",
+            compatError.message,
+          );
+
+          const dataWithoutNestedPayment = { ...compatibleOrderData };
+          delete dataWithoutNestedPayment.payment;
+
+          const createdOrder = await tx.order.create({
+            data: dataWithoutNestedPayment,
+            include: { items: true },
+          });
+
+          try {
+            await tx.payment.create({
+              data: {
+                orderId: createdOrder.id,
+                ...paymentPayload,
+              },
+            });
+          } catch (paymentError) {
+            if (!this.#isMissingColumnError(paymentError)) {
+              throw paymentError;
+            }
+
+            console.warn(
+              "[OrderService.createOrder] Payment não criado por schema legado:",
+              paymentError.message,
+            );
+          }
+
+          return { ...createdOrder, payment: null };
+        }
+      }
     });
 
     emitOrderCreated({
       orderId: order.id,
       userId: order.userId,
       mesaId: order.mesaId,
-      status: order.status,
-      total: Number(order.total),
+      status: order.status ?? "RECEBIDO",
+      total: Number(order.total ?? 0),
     });
 
     return order;
@@ -1053,6 +1121,46 @@ export class OrderService {
       );
     }
     await this.orderRepository.deleteById(orderId, userId);
+  }
+
+  #isMissingColumnError(error) {
+    const code = String(error?.code ?? "").toUpperCase();
+    const dbCode = String(error?.meta?.code ?? "").toUpperCase();
+    const message = String(error?.message ?? "").toLowerCase();
+
+    return (
+      code === "P2022" ||
+      code === "42703" ||
+      dbCode === "42703" ||
+      message.includes("does not exist")
+    );
+  }
+
+  async #getTableColumns(tx, tableName) {
+    const rows = await tx.$queryRaw`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = ${tableName}
+    `;
+
+    return new Set(rows.map((row) => row.column_name));
+  }
+
+  #buildOrderDataForColumns(orderData, orderColumns) {
+    const scalarEntries = Object.entries(orderData).filter(
+      ([key]) => key !== "items" && key !== "payment",
+    );
+
+    const compatibleScalars = Object.fromEntries(
+      scalarEntries.filter(([key]) => orderColumns.has(key)),
+    );
+
+    return {
+      ...compatibleScalars,
+      ...(orderData.items ? { items: orderData.items } : {}),
+      ...(orderData.payment ? { payment: orderData.payment } : {}),
+    };
   }
 
   async #normalizeItemInTransaction(tx, item) {
