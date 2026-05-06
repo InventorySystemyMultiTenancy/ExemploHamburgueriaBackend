@@ -82,26 +82,36 @@ export class OrderService {
       );
 
       for (const item of normalizedItems) {
-        const decremented = await tx.product.updateMany({
-          where: {
-            id: item.productId,
-            isActive: true,
-            stock: {
-              gte: item.quantity,
-            },
-          },
-          data: {
-            stock: {
-              decrement: item.quantity,
-            },
-          },
+        // stock = 0 significa "ilimitado / não controlado" (padrão para restaurante).
+        // Só decrementa e verifica estoque quando stock > 0.
+        const product = await tx.product.findFirst({
+          where: { id: item.productId, isActive: true },
+          select: { stock: true },
         });
 
-        if (decremented.count === 0) {
+        if (!product) {
           throw new AppError(
-            `Estoque insuficiente para o produto ${item.productId}.`,
-            409,
+            `Produto ${item.productId} não encontrado ou inativo.`,
+            422,
           );
+        }
+
+        if (product.stock > 0) {
+          const decremented = await tx.product.updateMany({
+            where: {
+              id: item.productId,
+              isActive: true,
+              stock: { gte: item.quantity },
+            },
+            data: { stock: { decrement: item.quantity } },
+          });
+
+          if (decremented.count === 0) {
+            throw new AppError(
+              `Estoque insuficiente para o produto ${item.productId}.`,
+              409,
+            );
+          }
         }
       }
 
