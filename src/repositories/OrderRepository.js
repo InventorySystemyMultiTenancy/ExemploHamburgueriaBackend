@@ -1,6 +1,11 @@
 import { prisma } from "../lib/prisma.js";
 
 export class OrderRepository {
+  _isMissingColumnError(error) {
+    const message = String(error?.message ?? "").toLowerCase();
+    return error?.code === "42703" || message.includes("does not exist");
+  }
+
   // Helpers: Prisma v6 não suporta arrays em $queryRaw template tags;
   // usamos $queryRawUnsafe com placeholders IN ($1, $2, ...) em vez de ANY($1::text[])
   async _fetchItemsForOrders(orderIds) {
@@ -183,8 +188,40 @@ export class OrderRepository {
       `;
       console.log("[findByUserId] orders count=", orders.length);
     } catch (e) {
-      console.error("[findByUserId] FALHOU na query de orders:", e);
-      throw e;
+      if (this._isMissingColumnError(e)) {
+        console.warn(
+          "[findByUserId] fallback ativado por coluna ausente no banco:",
+          e.message,
+        );
+
+        // Compatibilidade com bancos sem colunas recentes (deploy sem migration).
+        orders = await prisma.$queryRaw`
+          SELECT
+            o.id, o."userId", o.status::text AS status,
+            o."paymentStatus"::text AS "paymentStatus",
+            o."deliveryAddress", o.notes, o."paymentMethod",
+            o.total, o."createdAt", o."updatedAt"
+          FROM "Order" o
+          WHERE o."userId" = ${userId}
+          ORDER BY o."createdAt" DESC
+        `;
+
+        orders = orders.map((order) => ({
+          ...order,
+          deliveryFee: null,
+          deliveryLat: null,
+          deliveryLon: null,
+          isPickup: false,
+          assignedMotoboyId: null,
+          deliveryCode: null,
+          deliveredAt: null,
+        }));
+
+        console.log("[findByUserId] fallback orders count=", orders.length);
+      } else {
+        console.error("[findByUserId] FALHOU na query de orders:", e);
+        throw e;
+      }
     }
 
     if (!orders.length) return [];

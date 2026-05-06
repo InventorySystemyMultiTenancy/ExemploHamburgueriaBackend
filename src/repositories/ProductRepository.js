@@ -34,7 +34,15 @@ export class ProductRepository {
     }));
   }
 
-  async create({ name, description, imageUrl, category, isCrust, sizes }) {
+  async create({
+    name,
+    description,
+    imageUrl,
+    category,
+    isCrust,
+    stock,
+    sizes,
+  }) {
     // category é gravado via raw SQL para ser compatível com qualquer versão do Prisma Client
     const product = await prisma.product.create({
       data: {
@@ -42,6 +50,7 @@ export class ProductRepository {
         description: description ?? null,
         imageUrl: imageUrl ?? null,
         isCrust: isCrust ?? false,
+        ...(stock != null ? { stock } : {}),
         sizes: {
           create: sizes.map(({ size, price, costPrice }) => ({
             size,
@@ -59,7 +68,7 @@ export class ProductRepository {
 
   async update(
     productId,
-    { name, description, imageUrl, category, isCrust, sizes },
+    { name, description, imageUrl, category, isCrust, stock, sizes },
   ) {
     return prisma.$transaction(async (tx) => {
       await tx.product.update({
@@ -69,6 +78,7 @@ export class ProductRepository {
           ...(description !== undefined && { description }),
           ...(imageUrl !== undefined && { imageUrl }),
           ...(isCrust !== undefined && { isCrust }),
+          ...(stock !== undefined && { stock }),
         },
       });
 
@@ -149,7 +159,9 @@ export class ProductRepository {
     }
 
     const ids = rows.map((row) => row.productId);
-    const soldCountById = new Map(rows.map((row) => [row.productId, row.soldCount]));
+    const soldCountById = new Map(
+      rows.map((row) => [row.productId, row.soldCount]),
+    );
     const products = await prisma.product.findMany({
       where: {
         id: { in: ids },
@@ -161,8 +173,12 @@ export class ProductRepository {
       },
     });
 
-    const categoryMap = await fetchCategories(products.map((product) => product.id));
-    const productsById = new Map(products.map((product) => [product.id, product]));
+    const categoryMap = await fetchCategories(
+      products.map((product) => product.id),
+    );
+    const productsById = new Map(
+      products.map((product) => [product.id, product]),
+    );
 
     return ids
       .map((id) => productsById.get(id))
@@ -197,10 +213,7 @@ export class ProductRepository {
       return null;
     }
 
-    if (
-      typeof isCrust === "boolean" &&
-      sizeEntry.product.isCrust !== isCrust
-    ) {
+    if (typeof isCrust === "boolean" && sizeEntry.product.isCrust !== isCrust) {
       return null;
     }
 
