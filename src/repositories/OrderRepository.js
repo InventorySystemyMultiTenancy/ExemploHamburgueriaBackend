@@ -6,6 +6,63 @@ export class OrderRepository {
     return error?.code === "42703" || message.includes("does not exist");
   }
 
+  _pick(obj, keys, fallback = null) {
+    for (const key of keys) {
+      if (obj[key] !== undefined && obj[key] !== null) {
+        return obj[key];
+      }
+    }
+    return fallback;
+  }
+
+  _normalizeLegacyOrder(raw) {
+    return {
+      id: this._pick(raw, ["id"]),
+      userId: this._pick(raw, ["userId", "user_id", "userid"]),
+      status: this._pick(raw, ["status"], "RECEBIDO"),
+      paymentStatus: this._pick(
+        raw,
+        ["paymentStatus", "payment_status", "paymentstatus"],
+        "PENDENTE",
+      ),
+      deliveryAddress: this._pick(raw, ["deliveryAddress", "delivery_address"]),
+      notes: this._pick(raw, ["notes"]),
+      paymentMethod: this._pick(raw, ["paymentMethod", "payment_method"]),
+      total: this._pick(raw, ["total"], 0),
+      createdAt: this._pick(raw, ["createdAt", "created_at"]),
+      updatedAt: this._pick(raw, ["updatedAt", "updated_at"]),
+      deliveryFee: this._pick(raw, ["deliveryFee", "delivery_fee"]),
+      deliveryLat: this._pick(raw, ["deliveryLat", "delivery_lat"]),
+      deliveryLon: this._pick(raw, ["deliveryLon", "delivery_lon"]),
+      isPickup: this._pick(raw, ["isPickup", "is_pickup"], false),
+      assignedMotoboyId: this._pick(raw, [
+        "assignedMotoboyId",
+        "assigned_motoboy_id",
+      ]),
+      deliveryCode: this._pick(raw, ["deliveryCode", "delivery_code"]),
+      deliveredAt: this._pick(raw, ["deliveredAt", "delivered_at"]),
+    };
+  }
+
+  async _findByUserIdFromJsonFallback(userId) {
+    const rows = await prisma.$queryRaw`
+      SELECT to_jsonb(o) AS row
+      FROM "Order" o
+    `;
+
+    const normalized = rows
+      .map((r) => this._normalizeLegacyOrder(r.row ?? {}))
+      .filter((o) => String(o.userId ?? "") === String(userId));
+
+    normalized.sort((a, b) => {
+      const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return db - da;
+    });
+
+    return normalized;
+  }
+
   // Helpers: Prisma v6 não suporta arrays em $queryRaw template tags;
   // usamos $queryRawUnsafe com placeholders IN ($1, $2, ...) em vez de ANY($1::text[])
   async _fetchItemsForOrders(orderIds) {
@@ -30,23 +87,62 @@ export class OrderRepository {
         error.message,
       );
 
-      rows = await prisma.$queryRawUnsafe(
-        `SELECT
-           oi.id,
-           oi."order_id" AS "orderId",
-           oi."product_id" AS "productId",
-           oi.quantity,
-           oi."unit_price" AS "unitPrice",
-           oi."total_price" AS "totalPrice",
-           oi.addons,
-           oi."removed_ingredients" AS "removedIngredients",
-           oi.notes,
-           p.name AS "productName"
-         FROM "OrderItem" oi
-         LEFT JOIN "Product" p ON p.id = oi."product_id"
-         WHERE oi."order_id" IN (${ph})`,
-        ...orderIds,
-      );
+      try {
+        rows = await prisma.$queryRawUnsafe(
+          `SELECT
+             oi.id,
+             oi."order_id" AS "orderId",
+             oi."product_id" AS "productId",
+             oi.quantity,
+             oi."unit_price" AS "unitPrice",
+             oi."total_price" AS "totalPrice",
+             oi.addons,
+             oi."removed_ingredients" AS "removedIngredients",
+             oi.notes,
+             p.name AS "productName"
+           FROM "OrderItem" oi
+           LEFT JOIN "Product" p ON p.id = oi."product_id"
+           WHERE oi."order_id" IN (${ph})`,
+          ...orderIds,
+        );
+      } catch (legacyError) {
+        if (!this._isMissingColumnError(legacyError)) {
+          throw legacyError;
+        }
+
+        console.warn(
+          "[_fetchItemsForOrders] fallback JSON legado:",
+          legacyError.message,
+        );
+
+        const jsonRows = await prisma.$queryRaw`
+          SELECT to_jsonb(oi) AS row
+          FROM "OrderItem" oi
+        `;
+
+        rows = jsonRows
+          .map((r) => r.row ?? {})
+          .map((row) => ({
+            id: this._pick(row, ["id"]),
+            orderId: this._pick(row, ["orderId", "order_id", "orderid"]),
+            productId: this._pick(row, [
+              "productId",
+              "product_id",
+              "productid",
+            ]),
+            quantity: this._pick(row, ["quantity"], 1),
+            unitPrice: this._pick(row, ["unitPrice", "unit_price"], 0),
+            totalPrice: this._pick(row, ["totalPrice", "total_price"], 0),
+            addons: this._pick(row, ["addons"]),
+            removedIngredients: this._pick(row, [
+              "removedIngredients",
+              "removed_ingredients",
+            ]),
+            notes: this._pick(row, ["notes"]),
+            productName: null,
+          }))
+          .filter((row) => orderIds.includes(row.orderId));
+      }
     }
 
     return rows.map((row) => ({
@@ -75,21 +171,52 @@ export class OrderRepository {
         error.message,
       );
 
-      return prisma.$queryRawUnsafe(
-        `SELECT
-           id,
-           "order_id" AS "orderId",
-           provider,
-           "external_id" AS "externalId",
-           amount,
-           status::text AS status,
-           payload,
-           "created_at" AS "createdAt",
-           "updated_at" AS "updatedAt"
-         FROM "Payment"
-         WHERE "order_id" IN (${ph})`,
-        ...orderIds,
-      );
+      try {
+        return await prisma.$queryRawUnsafe(
+          `SELECT
+             id,
+             "order_id" AS "orderId",
+             provider,
+             "external_id" AS "externalId",
+             amount,
+             status::text AS status,
+             payload,
+             "created_at" AS "createdAt",
+             "updated_at" AS "updatedAt"
+           FROM "Payment"
+           WHERE "order_id" IN (${ph})`,
+          ...orderIds,
+        );
+      } catch (legacyError) {
+        if (!this._isMissingColumnError(legacyError)) {
+          throw legacyError;
+        }
+
+        console.warn(
+          "[_fetchPaymentsForOrders] fallback JSON legado:",
+          legacyError.message,
+        );
+
+        const jsonRows = await prisma.$queryRaw`
+          SELECT to_jsonb(p) AS row
+          FROM "Payment" p
+        `;
+
+        return jsonRows
+          .map((r) => r.row ?? {})
+          .map((row) => ({
+            id: this._pick(row, ["id"]),
+            orderId: this._pick(row, ["orderId", "order_id", "orderid"]),
+            provider: this._pick(row, ["provider"]),
+            externalId: this._pick(row, ["externalId", "external_id"]),
+            amount: this._pick(row, ["amount"], 0),
+            status: this._pick(row, ["status"], "PENDENTE"),
+            payload: this._pick(row, ["payload"]),
+            createdAt: this._pick(row, ["createdAt", "created_at"]),
+            updatedAt: this._pick(row, ["updatedAt", "updated_at"]),
+          }))
+          .filter((row) => orderIds.includes(row.orderId));
+      }
     }
   }
 
@@ -252,36 +379,34 @@ export class OrderRepository {
           e.message,
         );
 
-        // Compatibilidade com bancos legados em snake_case.
-        orders = await prisma.$queryRaw`
-          SELECT
-            o.id,
-            o."user_id" AS "userId",
-            o.status::text AS status,
-            o."payment_status"::text AS "paymentStatus",
-            o."delivery_address" AS "deliveryAddress",
-            o.notes,
-            o."payment_method" AS "paymentMethod",
-            o.total,
-            o."created_at" AS "createdAt",
-            o."updated_at" AS "updatedAt"
-          FROM "Order" o
-          WHERE o."user_id" = ${userId}
-          ORDER BY o."created_at" DESC
-        `;
-
-        if (!orders.length) {
-          // Compatibilidade com bancos sem colunas recentes (deploy sem migration).
+        try {
+          // Compatibilidade com bancos legados em snake_case.
           orders = await prisma.$queryRaw`
             SELECT
-              o.id, o."userId", o.status::text AS status,
-              o."paymentStatus"::text AS "paymentStatus",
-              o."deliveryAddress", o.notes, o."paymentMethod",
-              o.total, o."createdAt", o."updatedAt"
+              o.id,
+              o."user_id" AS "userId",
+              o.status::text AS status,
+              o."payment_status"::text AS "paymentStatus",
+              o."delivery_address" AS "deliveryAddress",
+              o.notes,
+              o."payment_method" AS "paymentMethod",
+              o.total,
+              o."created_at" AS "createdAt",
+              o."updated_at" AS "updatedAt"
             FROM "Order" o
-            WHERE o."userId" = ${userId}
-            ORDER BY o."createdAt" DESC
+            WHERE o."user_id" = ${userId}
+            ORDER BY o."created_at" DESC
           `;
+        } catch (snakeCaseError) {
+          if (!this._isMissingColumnError(snakeCaseError)) {
+            throw snakeCaseError;
+          }
+
+          console.warn(
+            "[findByUserId] fallback JSON legado:",
+            snakeCaseError.message,
+          );
+          orders = await this._findByUserIdFromJsonFallback(userId);
         }
 
         orders = orders.map((order) => ({
