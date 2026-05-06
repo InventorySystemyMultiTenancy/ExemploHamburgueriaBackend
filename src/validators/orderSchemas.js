@@ -2,9 +2,13 @@ import { z } from "zod";
 
 const itemSchema = z
   .object({
-    productId: z.string().cuid(),
+    productId: z.string().min(1).max(255),
     quantity: z.number().int().positive().max(20).optional(),
-    addonIds: z.array(z.string().cuid()).max(20).optional().default([]),
+    addonIds: z
+      .array(z.string().min(1).max(255))
+      .max(20)
+      .optional()
+      .default([]),
     removedIngredients: z.string().trim().min(1).max(255).optional(),
     notes: z.string().max(500).optional(),
   })
