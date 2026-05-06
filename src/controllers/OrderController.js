@@ -25,7 +25,20 @@ export class OrderController {
         data: order,
       });
     } catch (error) {
-      return this.#handleError(error, next);
+      return this.#handleError(error, next, {
+        route: "POST /api/orders",
+        userId: req.user?.id,
+        role: req.user?.role,
+        bodySummary: {
+          hasDeliveryAddress: Boolean(req.body?.deliveryAddress),
+          isPickup: req.body?.isPickup,
+          paymentMethod: req.body?.paymentMethod,
+          itemsCount: Array.isArray(req.body?.items)
+            ? req.body.items.length
+            : 0,
+          firstItem: Array.isArray(req.body?.items) ? req.body.items[0] : null,
+        },
+      });
     }
   }
 
@@ -311,9 +324,23 @@ export class OrderController {
     }
   }
 
-  #handleError(error, next) {
+  #handleError(error, next, context = null) {
     if (error instanceof ZodError) {
+      console.warn("[OrderController] Zod validation error", {
+        context,
+        issues: error.issues,
+        flattened: error.flatten(),
+      });
       return next(new AppError("Payload invalido.", 422, error.flatten()));
+    }
+
+    if (error instanceof AppError) {
+      console.warn("[OrderController] AppError", {
+        context,
+        statusCode: error.statusCode,
+        message: error.message,
+        details: error.details ?? null,
+      });
     }
 
     return next(error);
