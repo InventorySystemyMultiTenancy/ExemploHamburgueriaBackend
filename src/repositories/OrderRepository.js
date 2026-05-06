@@ -11,13 +11,44 @@ export class OrderRepository {
   async _fetchItemsForOrders(orderIds) {
     if (!orderIds.length) return [];
     const ph = orderIds.map((_, i) => `$${i + 1}`).join(", ");
-    const rows = await prisma.$queryRawUnsafe(
-      `SELECT oi.*, p.name AS "productName"
-       FROM "OrderItem" oi
-       LEFT JOIN "Product" p ON p.id = oi."productId"
-       WHERE oi."orderId" IN (${ph})`,
-      ...orderIds,
-    );
+    let rows;
+    try {
+      rows = await prisma.$queryRawUnsafe(
+        `SELECT oi.*, p.name AS "productName"
+         FROM "OrderItem" oi
+         LEFT JOIN "Product" p ON p.id = oi."productId"
+         WHERE oi."orderId" IN (${ph})`,
+        ...orderIds,
+      );
+    } catch (error) {
+      if (!this._isMissingColumnError(error)) {
+        throw error;
+      }
+
+      console.warn(
+        "[_fetchItemsForOrders] fallback legado (snake_case):",
+        error.message,
+      );
+
+      rows = await prisma.$queryRawUnsafe(
+        `SELECT
+           oi.id,
+           oi."order_id" AS "orderId",
+           oi."product_id" AS "productId",
+           oi.quantity,
+           oi."unit_price" AS "unitPrice",
+           oi."total_price" AS "totalPrice",
+           oi.addons,
+           oi."removed_ingredients" AS "removedIngredients",
+           oi.notes,
+           p.name AS "productName"
+         FROM "OrderItem" oi
+         LEFT JOIN "Product" p ON p.id = oi."product_id"
+         WHERE oi."order_id" IN (${ph})`,
+        ...orderIds,
+      );
+    }
+
     return rows.map((row) => ({
       ...row,
       product: row.productName
@@ -29,10 +60,37 @@ export class OrderRepository {
   async _fetchPaymentsForOrders(orderIds) {
     if (!orderIds.length) return [];
     const ph = orderIds.map((_, i) => `$${i + 1}`).join(", ");
-    return prisma.$queryRawUnsafe(
-      `SELECT * FROM "Payment" WHERE "orderId" IN (${ph})`,
-      ...orderIds,
-    );
+    try {
+      return await prisma.$queryRawUnsafe(
+        `SELECT * FROM "Payment" WHERE "orderId" IN (${ph})`,
+        ...orderIds,
+      );
+    } catch (error) {
+      if (!this._isMissingColumnError(error)) {
+        throw error;
+      }
+
+      console.warn(
+        "[_fetchPaymentsForOrders] fallback legado (snake_case):",
+        error.message,
+      );
+
+      return prisma.$queryRawUnsafe(
+        `SELECT
+           id,
+           "order_id" AS "orderId",
+           provider,
+           "external_id" AS "externalId",
+           amount,
+           status::text AS status,
+           payload,
+           "created_at" AS "createdAt",
+           "updated_at" AS "updatedAt"
+         FROM "Payment"
+         WHERE "order_id" IN (${ph})`,
+        ...orderIds,
+      );
+    }
   }
 
   async _fetchUsersForOrders(orderIds) {
@@ -194,17 +252,37 @@ export class OrderRepository {
           e.message,
         );
 
-        // Compatibilidade com bancos sem colunas recentes (deploy sem migration).
+        // Compatibilidade com bancos legados em snake_case.
         orders = await prisma.$queryRaw`
           SELECT
-            o.id, o."userId", o.status::text AS status,
-            o."paymentStatus"::text AS "paymentStatus",
-            o."deliveryAddress", o.notes, o."paymentMethod",
-            o.total, o."createdAt", o."updatedAt"
+            o.id,
+            o."user_id" AS "userId",
+            o.status::text AS status,
+            o."payment_status"::text AS "paymentStatus",
+            o."delivery_address" AS "deliveryAddress",
+            o.notes,
+            o."payment_method" AS "paymentMethod",
+            o.total,
+            o."created_at" AS "createdAt",
+            o."updated_at" AS "updatedAt"
           FROM "Order" o
-          WHERE o."userId" = ${userId}
-          ORDER BY o."createdAt" DESC
+          WHERE o."user_id" = ${userId}
+          ORDER BY o."created_at" DESC
         `;
+
+        if (!orders.length) {
+          // Compatibilidade com bancos sem colunas recentes (deploy sem migration).
+          orders = await prisma.$queryRaw`
+            SELECT
+              o.id, o."userId", o.status::text AS status,
+              o."paymentStatus"::text AS "paymentStatus",
+              o."deliveryAddress", o.notes, o."paymentMethod",
+              o.total, o."createdAt", o."updatedAt"
+            FROM "Order" o
+            WHERE o."userId" = ${userId}
+            ORDER BY o."createdAt" DESC
+          `;
+        }
 
         orders = orders.map((order) => ({
           ...order,
